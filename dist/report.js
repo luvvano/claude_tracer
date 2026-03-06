@@ -37,485 +37,391 @@ exports.generateReport = generateReport;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const shared_1 = require("./shared");
-// ─── formatting helpers ───────────────────────────────────────────────────────
-function fmtDuration(ms) {
+// ─── helpers ──────────────────────────────────────────────────────────────────
+function fmtDur(ms) {
     if (ms < 1000)
         return `${ms}ms`;
     if (ms < 60_000)
         return `${(ms / 1000).toFixed(1)}s`;
-    const m = Math.floor(ms / 60_000);
-    const s = Math.floor((ms % 60_000) / 1000);
-    return `${m}m ${s}s`;
+    return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
 }
 function escHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function escJs(s) {
-    return s.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-}
-function serializeGroup(g) {
+function serializeCall(c) {
+    const inTok = c.usage?.input_tokens ?? 0;
+    const outTok = c.usage?.output_tokens ?? 0;
     return {
-        id: g.id.slice(0, 40),
-        label: g.label,
-        callCount: g.stats.callCount,
-        inputTokens: g.stats.totalInputTokens,
-        outputTokens: g.stats.totalOutputTokens,
-        durationMs: g.stats.durationMs,
-        children: g.children.map(serializeGroup),
-        calls: g.calls.map(c => ({
-            callIndex: c.call_index,
-            ts: c.ts,
-            msgCount: c.messages.length,
-            inputTokens: c.usage?.input_tokens ?? 0,
-            outputTokens: c.usage?.output_tokens ?? 0,
-            cacheTokens: c.usage?.cache_read_input_tokens ?? 0,
-            durationMs: c.duration_ms,
-            model: c.model,
-            contextReset: c.context_reset ?? false,
-            diff: (c.diff ?? []).map(e => ({
-                role: e.role,
-                isToolUse: e.is_tool_use,
-                toolName: e.tool_name,
-                contentSummary: e.content_summary.slice(0, 500),
-            })),
+        idx: c.call_index,
+        ts: c.ts,
+        msgCount: c.messages.length,
+        inTok,
+        outTok,
+        cacheTok: c.usage?.cache_read_input_tokens ?? 0,
+        durMs: c.duration_ms,
+        model: c.model,
+        reset: c.context_reset ?? false,
+        diff: (c.diff ?? []).map(e => ({
+            role: e.role,
+            isToolUse: e.is_tool_use,
+            toolName: e.tool_name,
+            summary: e.content_summary.slice(0, 400),
         })),
     };
 }
-function sumTokens(g) {
-    return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTokens(c), 0);
+function serializeGroup(g) {
+    return {
+        id: g.id,
+        label: g.label,
+        callCount: g.stats.callCount,
+        inputTok: g.stats.totalInputTokens,
+        outputTok: g.stats.totalOutputTokens,
+        durationMs: g.stats.durationMs,
+        children: g.children.map(serializeGroup),
+        calls: g.calls.map(serializeCall),
+    };
 }
-// ─── HTML document ────────────────────────────────────────────────────────────
+function sumTok(g) {
+    return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTok(c), 0);
+}
+// ─── HTML ─────────────────────────────────────────────────────────────────────
 function buildHtml(root, sessionId) {
-    const treeData = JSON.stringify(serializeGroup(root));
-    const totalTok = sumTokens(root);
-    const generatedAt = new Date().toISOString();
+    const data = JSON.stringify(serializeGroup(root));
+    const totalTok = sumTok(root);
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>claude-tracer: ${escHtml(sessionId)}</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-  font-size: 13px;
-  background: #f8f8f8;
-  color: #111;
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-}
-#header {
-  background: #fff;
-  border-bottom: 1px solid #ddd;
-  padding: 8px 16px;
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  flex-shrink: 0;
-}
-#header h1 { font-size: 14px; font-weight: 700; color: #1a6cf5; }
-#header .meta { font-size: 11px; color: #888; }
-#main { display: flex; flex: 1; overflow: hidden; }
-#graph-container {
-  flex: 1;
-  overflow: hidden;
-  position: relative;
-  background: #fafafa;
-  cursor: grab;
-}
-#graph-container:active { cursor: grabbing; }
-#svg-wrap {
-  position: absolute;
-  top: 0; left: 0;
-  transform-origin: 0 0;
-}
-svg text { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
-.node-box {
-  fill: #fff;
-  stroke: #555;
-  stroke-width: 1.5;
-  rx: 4;
-  cursor: pointer;
-}
-.node-box:hover { stroke: #1a6cf5; stroke-width: 2; }
-.node-box.selected { stroke: #1a6cf5; stroke-width: 2.5; fill: #eef4ff; }
-.node-label { font-size: 12px; font-weight: 700; fill: #111; }
-.node-stat  { font-size: 11px; fill: #444; }
-.node-pct   { font-size: 10px; fill: #888; }
-.edge { fill: none; stroke: #999; stroke-width: 1.5; marker-end: url(#arrow); }
-.edge-label { font-size: 10px; fill: #999; }
-#detail-panel {
-  width: 340px;
-  border-left: 1px solid #ddd;
-  background: #fff;
-  overflow-y: auto;
-  flex-shrink: 0;
-  display: none;
-}
-#detail-panel.visible { display: block; }
-#detail-header {
-  padding: 10px 14px;
-  border-bottom: 1px solid #eee;
-  font-weight: 700;
-  font-size: 13px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-#detail-close { cursor: pointer; color: #aaa; font-size: 16px; line-height: 1; }
-#detail-close:hover { color: #333; }
-.call-item {
-  border-bottom: 1px solid #f0f0f0;
-  padding: 8px 14px;
-  cursor: pointer;
-}
-.call-item:hover { background: #f5f8ff; }
-.call-item.open { background: #eef4ff; }
-.call-row { display: flex; gap: 8px; align-items: center; font-size: 11px; }
-.call-idx  { color: #aaa; min-width: 28px; }
-.call-time { color: #2a9d3d; min-width: 56px; }
-.call-msgs { color: #1a6cf5; min-width: 44px; }
-.call-tok  { color: #e67e22; min-width: 72px; }
-.call-dur  { color: #aaa; }
-.call-reset { color: #e74c3c; font-weight: 700; margin-left: 4px; }
-.call-detail { display: none; padding: 6px 0 0 0; }
-.call-item.open .call-detail { display: block; }
-.diff-line {
-  font-size: 11px;
-  padding: 2px 0;
-  display: flex;
-  gap: 6px;
-  border-bottom: 1px solid #f5f5f5;
-}
-.diff-line:last-child { border-bottom: none; }
-.diff-role {
-  min-width: 64px;
-  font-weight: 600;
-  padding: 1px 4px;
-  border-radius: 2px;
-  font-size: 10px;
-}
-.diff-user .diff-role { background: #e8f9ed; color: #2a9d3d; }
-.diff-assistant .diff-role { background: #eef4ff; color: #1a6cf5; }
-.diff-content { color: #444; word-break: break-word; }
-.tool-badge { background: #f0f0f0; border: 1px solid #ddd; padding: 1px 5px; border-radius: 3px; color: #1a6cf5; font-size: 10px; }
-.tool-result-badge { background: #f0f0f0; border: 1px solid #ddd; padding: 1px 5px; border-radius: 3px; color: #888; font-size: 10px; }
-.call-meta { font-size: 10px; color: #aaa; padding-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
-.reset-banner { background: #fef0ef; color: #e74c3c; font-weight: 600; padding: 3px 6px; border-radius: 3px; font-size: 11px; margin-bottom: 4px; }
-#hint { position: absolute; bottom: 10px; left: 10px; font-size: 11px; color: #bbb; pointer-events: none; }
+body { font-family: 'SF Mono','Fira Code','Consolas',monospace; font-size: 13px; background:#0d1117; color:#c9d1d9; }
+#hdr { background:#161b22; border-bottom:1px solid #30363d; padding:10px 16px; display:flex; gap:20px; align-items:center; position:sticky; top:0; z-index:10; }
+#hdr h1 { font-size:14px; color:#58a6ff; font-weight:700; }
+.meta { font-size:11px; color:#8b949e; }
+#zoom { font-size:11px; color:#8b949e; margin-left:auto; }
+#viewport { width:100%; height:calc(100vh - 41px); overflow:hidden; position:relative; cursor:grab; background:#0d1117; }
+#viewport:active { cursor:grabbing; }
+#canvas { position:absolute; transform-origin:0 0; }
+/* SVG */
+svg { overflow:visible; }
+.edge { fill:none; stroke:#484f58; stroke-width:1.5; }
+.edge-spawn { fill:none; stroke:#388bfd; stroke-width:1.5; stroke-dasharray:4 3; }
+/* Nodes */
+.gnode { cursor:pointer; }
+.gnode rect { rx:6; stroke-width:1.5; transition:filter .15s; }
+.gnode:hover rect { filter:brightness(1.25); }
+.gnode.active rect { stroke-width:2.5 !important; }
+.gnode text { font-family:'SF Mono','Fira Code','Consolas',monospace; }
+/* Detail panel */
+#detail { position:fixed; bottom:0; left:0; right:0; max-height:45vh; background:#161b22; border-top:2px solid #30363d; z-index:20; display:none; overflow:hidden; flex-direction:column; }
+#detail.open { display:flex; }
+#dh { padding:8px 16px; border-bottom:1px solid #30363d; display:flex; align-items:center; gap:10px; flex-shrink:0; }
+#dh strong { color:#e6edf3; font-size:13px; }
+#dh .ds { color:#8b949e; font-size:11px; }
+#dclose { margin-left:auto; cursor:pointer; color:#8b949e; font-size:18px; line-height:1; }
+#dclose:hover { color:#e6edf3; }
+#dcalls { overflow-y:auto; flex:1; }
+.ci { border-bottom:1px solid #21262d; }
+.ch { display:flex; gap:10px; align-items:center; padding:6px 16px; cursor:pointer; font-size:12px; }
+.ch:hover { background:#21262d; }
+.ci.open .ch { background:#1c2333; }
+.cn { color:#8b949e; min-width:30px; }
+.ct { color:#3fb950; min-width:62px; }
+.cm { color:#79c0ff; min-width:48px; }
+.ck { color:#e3b341; min-width:80px; }
+.cd { color:#8b949e; }
+.cr { color:#f85149; font-weight:700; margin-left:4px; }
+.ca { display:none; padding:6px 16px 10px 44px; }
+.ci.open .ca { display:block; }
+.de { display:flex; gap:8px; align-items:flex-start; padding:3px 0; border-bottom:1px solid #21262d; font-size:11px; }
+.de:last-child { border-bottom:none; }
+.dr { min-width:66px; font-weight:600; font-size:10px; padding:2px 5px; border-radius:2px; }
+.du .dr { background:#0e4429; color:#3fb950; }
+.da .dr { background:#0d419d; color:#79c0ff; }
+.dc { color:#c9d1d9; word-break:break-word; }
+.tb { background:#21262d; border:1px solid #30363d; padding:1px 5px; border-radius:3px; color:#79c0ff; font-size:10px; }
+.trb { background:#21262d; border:1px solid #30363d; padding:1px 5px; border-radius:3px; color:#8b949e; font-size:10px; }
+.dm { font-size:10px; color:#8b949e; padding-top:4px; display:flex; gap:10px; flex-wrap:wrap; border-top:1px solid #21262d; margin-top:4px; }
+.rb { background:#3d1210; color:#f85149; font-weight:600; padding:3px 8px; border-radius:3px; font-size:11px; margin-bottom:4px; }
 </style>
 </head>
 <body>
-
-<div id="header">
+<div id="hdr">
   <h1>⚡ claude-tracer: ${escHtml(sessionId)}</h1>
-  <span class="meta">Generated: ${generatedAt}</span>
   <span class="meta">Total input tokens: ${(0, shared_1.fmt)(totalTok)}</span>
-  <span class="meta" id="zoom-label">zoom: 100%</span>
+  <span class="meta">${new Date().toISOString()}</span>
+  <span id="zoom">zoom: 100% · scroll=zoom · drag=pan</span>
 </div>
-
-<div id="main">
-  <div id="graph-container">
-    <div id="svg-wrap">
-      <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="#999"/>
-          </marker>
-        </defs>
-        <g id="edges"></g>
-        <g id="nodes"></g>
-      </svg>
-    </div>
-    <div id="hint">scroll to zoom · drag to pan · click node to inspect</div>
-  </div>
-  <div id="detail-panel">
-    <div id="detail-header">
-      <span id="detail-title">Calls</span>
-      <span id="detail-close">✕</span>
-    </div>
-    <div id="detail-body"></div>
+<div id="viewport">
+  <div id="canvas">
+    <svg id="svg"></svg>
   </div>
 </div>
-
+<div id="detail">
+  <div id="dh">
+    <strong id="dtitle"></strong>
+    <span class="ds" id="dstats"></span>
+    <span id="dclose">✕</span>
+  </div>
+  <div id="dcalls"></div>
+</div>
 <script>
-const TREE = ${treeData};
+const ROOT = ${data};
 
-// ─── layout ───────────────────────────────────────────────────────────────────
+// ─── layout constants ─────────────────────────────────────────────────────────
+const NW = 190, NH = 76, HGAP = 48, VGAP = 80;
 
-const NODE_W = 180;
-const NODE_H = 72;
-const H_GAP  = 40;
-const V_GAP  = 90;
-
-function subtreeWidth(node) {
-  if (!node.children.length) return NODE_W;
-  const childrenW = node.children.reduce((s, c) => s + subtreeWidth(c), 0)
-    + H_GAP * (node.children.length - 1);
-  return Math.max(NODE_W, childrenW);
+// ─── recursive subtree width ──────────────────────────────────────────────────
+function treeW(n) {
+  if (!n.children.length) return NW;
+  const cw = n.children.reduce((s,c) => s + treeW(c), 0) + HGAP * (n.children.length - 1);
+  return Math.max(NW, cw);
 }
 
-function layout(node, x, y) {
-  node._x = x;
-  node._y = y;
-  if (!node.children.length) return;
-  const totalW = node.children.reduce((s, c) => s + subtreeWidth(c), 0)
-    + H_GAP * (node.children.length - 1);
-  let cx = x - totalW / 2 + subtreeWidth(node.children[0]) / 2;
-  for (const child of node.children) {
-    layout(child, cx, y + NODE_H + V_GAP);
-    cx += subtreeWidth(child) + H_GAP;
-  }
-  // center over children
-  if (node.children.length) {
-    const first = node.children[0];
-    const last  = node.children[node.children.length - 1];
-    node._x = (first._x + last._x) / 2;
-  }
+// ─── layout: assign _x, _y ───────────────────────────────────────────────────
+function layout(n, x, y) {
+  n._y = y;
+  if (!n.children.length) { n._x = x; return; }
+  const tw = n.children.reduce((s,c) => s + treeW(c), 0) + HGAP*(n.children.length-1);
+  let cx = x - tw/2 + treeW(n.children[0])/2;
+  n.children.forEach(c => {
+    layout(c, cx, y + NH + VGAP);
+    cx += treeW(c) + HGAP;
+  });
+  const f = n.children[0], l = n.children[n.children.length-1];
+  n._x = (f._x + l._x) / 2;
 }
 
-function allNodes(node, out = []) {
-  out.push(node);
-  node.children.forEach(c => allNodes(c, out));
-  return out;
-}
+function allNodes(n, out=[]) { out.push(n); n.children.forEach(c=>allNodes(c,out)); return out; }
 
-// ─── render ───────────────────────────────────────────────────────────────────
+layout(ROOT, 0, 0);
+const nodes = allNodes(ROOT);
 
-const totalTok = (function sum(n) { return n.inputTokens + n.children.reduce((s,c) => s+sum(c), 0); })(TREE);
+// bounding box
+const PAD = 60;
+const xs = nodes.map(n=>n._x), ys = nodes.map(n=>n._y);
+const ox = Math.min(...xs) - PAD, oy = Math.min(...ys) - PAD;
+const sw = Math.max(...xs) - Math.min(...xs) + NW + PAD*2;
+const sh = Math.max(...ys) - Math.min(...ys) + NH + PAD*2;
 
-function pct(val) {
-  if (!totalTok) return '0%';
-  return (val / totalTok * 100).toFixed(1) + '%';
-}
+// total tokens (for %)
+function sumTok(n) { return n.inputTok + n.children.reduce((s,c)=>s+sumTok(c),0); }
+const TOTAL = sumTok(ROOT) || 1;
 
-function fmtTok(n) {
-  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n/1000).toFixed(1) + 'k';
-  return String(n);
-}
-
+function fmtTok(n) { return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n); }
 function fmtDur(ms) {
-  if (ms < 1000) return ms + 'ms';
-  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
-  return Math.floor(ms/60000) + 'm ' + Math.floor((ms%60000)/1000) + 's';
+  if(ms<1000) return ms+'ms';
+  if(ms<60000) return (ms/1000).toFixed(1)+'s';
+  return Math.floor(ms/60000)+'m '+Math.floor((ms%60000)/1000)+'s';
 }
+function fmtTime(ts){ try{return new Date(ts).toTimeString().slice(0,8);}catch{return ts;} }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-function fmtTime(ts) {
-  try { return new Date(ts).toTimeString().slice(0,8); } catch { return ts; }
-}
+// Colors per depth (pprof-inspired)
+const COLORS = [
+  {fill:'#0d2045', stroke:'#1f6feb', text:'#79c0ff'},  // depth 0 - blue
+  {fill:'#12260e', stroke:'#238636', text:'#3fb950'},   // depth 1 - green
+  {fill:'#1e0a2e', stroke:'#6e40c9', text:'#bc8cff'},   // depth 2 - purple
+  {fill:'#2a150a', stroke:'#9e4e00', text:'#f0883e'},   // depth 3 - orange
+  {fill:'#0a1f2a', stroke:'#1158a7', text:'#58a6ff'},   // depth 4 - cyan
+];
+function clr(depth) { return COLORS[Math.min(depth, COLORS.length-1)]; }
 
-layout(TREE, 0, 0);
-const nodes = allNodes(TREE);
-
-// compute bounding box
-const pad = 40;
-const xs = nodes.map(n => n._x);
-const ys = nodes.map(n => n._y);
-const minX = Math.min(...xs) - pad;
-const minY = Math.min(...ys) - pad;
-const maxX = Math.max(...xs) + NODE_W + pad;
-const maxY = Math.max(...ys) + NODE_H + pad;
-const svgW = maxX - minX;
-const svgH = maxY - minY;
-
-const svg = document.getElementById('graph-svg');
-svg.setAttribute('width', svgW);
-svg.setAttribute('height', svgH);
-
-const edgesG = document.getElementById('edges');
-const nodesG = document.getElementById('nodes');
-
-function mkSvg(tag, attrs) {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs={}) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,v);
   return el;
 }
 
+const svg = document.getElementById('svg');
+svg.setAttribute('width', sw);
+svg.setAttribute('height', sh);
+
+// arrow marker
+const defs = mk('defs');
+const marker = mk('marker', {id:'arr',markerWidth:'8',markerHeight:'6',refX:'7',refY:'3',orient:'auto'});
+const poly = mk('polygon', {points:'0,0 8,3 0,6',fill:'#484f58'});
+marker.appendChild(poly);
+defs.appendChild(marker);
+svg.appendChild(defs);
+
+const markerSpawn = mk('marker', {id:'arr2',markerWidth:'8',markerHeight:'6',refX:'7',refY:'3',orient:'auto'});
+const poly2 = mk('polygon', {points:'0,0 8,3 0,6',fill:'#388bfd'});
+markerSpawn.appendChild(poly2);
+defs.appendChild(markerSpawn);
+
+const eG = mk('g'); svg.appendChild(eG);
+const nG = mk('g'); svg.appendChild(nG);
+
 // draw edges
-function drawEdges(node) {
-  for (const child of node.children) {
-    const x1 = node._x - minX + NODE_W/2;
-    const y1 = node._y - minY + NODE_H;
-    const x2 = child._x - minX + NODE_W/2;
-    const y2 = child._y - minY;
-    const mx = (x1 + x2) / 2;
-    const path = mkSvg('path', {
-      class: 'edge',
-      d: \`M\${x1},\${y1} C\${x1},\${mx} \${x2},\${mx} \${x2},\${y2}\`,
-    });
-    edgesG.appendChild(path);
+function drawEdge(parent, child, depth) {
+  const x1 = parent._x - ox + NW/2;
+  const y1 = parent._y - oy + NH;
+  const x2 = child._x - ox + NW/2;
+  const y2 = child._y - oy;
+  const my = (y1 + y2) / 2;
+  const isChild = depth > 0;
+  const p = mk('path', {
+    class: isChild ? 'edge-spawn' : 'edge',
+    d: \`M\${x1},\${y1} C\${x1},\${my} \${x2},\${my} \${x2},\${y2}\`,
+  });
+  p.setAttribute('marker-end', isChild ? 'url(#arr2)' : 'url(#arr)');
+  eG.appendChild(p);
 
-    // edge label: child call count
-    const lx = (x1 + x2) / 2;
-    const ly = (y1 + y2) / 2;
-    const lbl = mkSvg('text', { class: 'edge-label', x: lx + 4, y: ly, 'text-anchor': 'start' });
-    lbl.textContent = child.callCount + ' calls';
-    edgesG.appendChild(lbl);
-
-    drawEdges(child);
-  }
+  // edge label
+  const t = mk('text', {'text-anchor':'middle', x:(x1+x2)/2, y:(y1+y2)/2-4,
+    style:'font-size:10px;fill:#484f58;font-family:monospace'});
+  t.textContent = child.callCount + ' call' + (child.callCount!==1?'s':'');
+  eG.appendChild(t);
 }
-drawEdges(TREE);
+
+function drawEdges(n, depth=0) {
+  n.children.forEach(c => { drawEdge(n, c, depth); drawEdges(c, depth+1); });
+}
+drawEdges(ROOT);
 
 // draw nodes
-let selectedId = null;
+let activeEl = null;
 
-function drawNode(node) {
-  const nx = node._x - minX;
-  const ny = node._y - minY;
-  const g = mkSvg('g', { class: 'node-group', 'data-id': node.id });
+function drawNode(n, depth) {
+  const nx = n._x - ox, ny = n._y - oy;
+  const c = clr(depth);
+  const pct = TOTAL>0?(n.inputTok/TOTAL*100).toFixed(1):'0.0';
 
-  const rect = mkSvg('rect', {
-    class: 'node-box',
-    x: nx, y: ny,
-    width: NODE_W, height: NODE_H,
-    rx: 4,
+  const g = mk('g', {class:'gnode'});
+
+  const rect = mk('rect', {
+    x:nx, y:ny, width:NW, height:NH,
+    fill:c.fill, stroke:c.stroke, rx:5,
   });
   g.appendChild(rect);
 
-  // label (truncate)
-  const maxLabelLen = 22;
-  const labelText = node.label.length > maxLabelLen ? node.label.slice(0, maxLabelLen) + '…' : node.label;
-  const lbl = mkSvg('text', { class: 'node-label', x: nx + NODE_W/2, y: ny + 18, 'text-anchor': 'middle' });
-  lbl.textContent = labelText;
-  g.appendChild(lbl);
+  // label
+  const maxL = 24;
+  const label = n.label.length>maxL ? n.label.slice(0,maxL)+'…' : n.label;
+  const t1 = mk('text', {x:nx+NW/2, y:ny+17, 'text-anchor':'middle',
+    style:\`font-size:12px;font-weight:700;fill:\${c.text}\`});
+  t1.textContent = label;
+  g.appendChild(t1);
 
-  const s1 = mkSvg('text', { class: 'node-stat', x: nx + NODE_W/2, y: ny + 34, 'text-anchor': 'middle' });
-  s1.textContent = fmtTok(node.inputTokens) + ' in tok';
-  g.appendChild(s1);
+  const tok = fmtTok(n.inputTok);
+  const t2 = mk('text', {x:nx+NW/2, y:ny+33, 'text-anchor':'middle',
+    style:'font-size:11px;fill:#e3b341'});
+  t2.textContent = tok + ' in tok';
+  g.appendChild(t2);
 
-  const s2 = mkSvg('text', { class: 'node-pct', x: nx + NODE_W/2, y: ny + 48, 'text-anchor': 'middle' });
-  s2.textContent = pct(node.inputTokens) + ' of total · ' + fmtDur(node.durationMs);
-  g.appendChild(s2);
+  const t3 = mk('text', {x:nx+NW/2, y:ny+48, 'text-anchor':'middle',
+    style:'font-size:10px;fill:#8b949e'});
+  t3.textContent = pct + '% of total · ' + fmtDur(n.durationMs);
+  g.appendChild(t3);
 
-  const s3 = mkSvg('text', { class: 'node-pct', x: nx + NODE_W/2, y: ny + 62, 'text-anchor': 'middle' });
-  s3.textContent = node.callCount + ' call' + (node.callCount !== 1 ? 's' : '');
-  g.appendChild(s3);
+  const t4 = mk('text', {x:nx+NW/2, y:ny+63, 'text-anchor':'middle',
+    style:'font-size:10px;fill:#8b949e'});
+  t4.textContent = n.callCount + ' call' + (n.callCount!==1?'s':'');
+  g.appendChild(t4);
 
-  g.addEventListener('click', (e) => {
+  g.addEventListener('click', e => {
     e.stopPropagation();
-    selectNode(node, rect);
+    if(activeEl) activeEl.classList.remove('active');
+    g.classList.add('active');
+    activeEl = g;
+    openDetail(n);
   });
 
-  nodesG.appendChild(g);
-  node.children.forEach(drawNode);
+  nG.appendChild(g);
+  n.children.forEach(c2 => drawNode(c2, depth+1));
 }
-drawNode(TREE);
+drawNode(ROOT, 0);
 
-// ─── pan + zoom ────────────────────────────────────────────────────────────────
-
-const wrap = document.getElementById('svg-wrap');
-const container = document.getElementById('graph-container');
-let scale = 1, tx = 40, ty = 40;
-
-function applyTransform() {
-  wrap.style.transform = \`translate(\${tx}px, \${ty}px) scale(\${scale})\`;
-  document.getElementById('zoom-label').textContent = 'zoom: ' + Math.round(scale*100) + '%';
-}
-applyTransform();
-
-container.addEventListener('wheel', e => {
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.1 : 0.9;
-  const rect = container.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  tx = mx - (mx - tx) * factor;
-  ty = my - (my - ty) * factor;
-  scale *= factor;
-  applyTransform();
-}, { passive: false });
-
-let dragging = false, dragStartX, dragStartY, dragTx, dragTy;
-container.addEventListener('mousedown', e => {
-  dragging = true;
-  dragStartX = e.clientX; dragStartY = e.clientY;
-  dragTx = tx; dragTy = ty;
-});
-window.addEventListener('mousemove', e => {
-  if (!dragging) return;
-  tx = dragTx + (e.clientX - dragStartX);
-  ty = dragTy + (e.clientY - dragStartY);
-  applyTransform();
-});
-window.addEventListener('mouseup', () => { dragging = false; });
+// auto-open root
+openDetail(ROOT);
+nG.firstChild?.classList.add('active');
+activeEl = nG.firstChild;
 
 // ─── detail panel ─────────────────────────────────────────────────────────────
 
-function selectNode(node, rect) {
-  // deselect previous
-  document.querySelectorAll('.node-box.selected').forEach(el => el.classList.remove('selected'));
-  rect.classList.add('selected');
+function openDetail(n) {
+  const panel = document.getElementById('detail');
+  panel.classList.add('open');
+  document.getElementById('dtitle').textContent = n.label;
+  document.getElementById('dstats').textContent =
+    n.callCount + ' calls · ' + fmtTok(n.inputTok) + ' in tok · ' + fmtDur(n.durationMs);
 
-  const panel = document.getElementById('detail-panel');
-  const title = document.getElementById('detail-title');
-  const body  = document.getElementById('detail-body');
-  panel.classList.add('visible');
-  title.textContent = node.label.length > 28 ? node.label.slice(0,28)+'…' : node.label;
-
-  body.innerHTML = node.calls.map((call, i) => {
+  const body = document.getElementById('dcalls');
+  body.innerHTML = n.calls.map((call,i) => {
     const diffHtml = call.diff.map(e => {
       let content = '';
       if (e.isToolUse && e.toolName) {
-        const m = e.contentSummary.match(/"(?:path|file_path|command)"\\s*:\\s*"([^"]+)"/);
-        content = \`<span class="tool-badge">\${esc(e.toolName)}\${m ? ' → ' + esc(m[1]) : ''}</span>\`;
-      } else if (e.contentSummary.includes('"type":"tool_result"') || e.contentSummary.includes('"type": "tool_result"')) {
-        content = \`<span class="tool-result-badge">tool_result</span>\`;
+        const m = e.summary.match(/"(?:path|file_path|command)"\\s*:\\s*"([^"]+)"/);
+        content = \`<span class="tb">\${esc(e.toolName)}\${m?' → '+esc(m[1]):''}</span>\`;
+      } else if (e.summary.includes('"type":"tool_result"')||e.summary.includes('"type": "tool_result"')) {
+        content = '<span class="trb">tool_result</span>';
       } else {
-        const s = e.contentSummary.replace(/\\n/g,' ').slice(0,300);
-        content = \`<span class="diff-content">\${esc(s)}\${e.contentSummary.length>300?'…':''}</span>\`;
+        const s = e.summary.replace(/\\n/g,' ').slice(0,300);
+        content = \`<span class="dc">\${esc(s)}\${e.summary.length>300?'…':''}</span>\`;
       }
-      return \`<div class="diff-line diff-\${esc(e.role)}"><span class="diff-role">\${esc(e.role)}</span>\${content}</div>\`;
+      return \`<div class="de d\${esc(e.role[0])}"><span class="dr">\${esc(e.role)}</span>\${content}</div>\`;
     }).join('');
 
-    return \`<div class="call-item" onclick="toggleCall(this)">
-      <div class="call-row">
-        <span class="call-idx">#\${call.callIndex}</span>
-        <span class="call-time">\${fmtTime(call.ts)}</span>
-        <span class="call-msgs">\${call.msgCount} msgs</span>
-        <span class="call-tok">\${fmtTok(call.inputTokens)} in</span>
-        <span class="call-dur">\${fmtDur(call.durationMs)}</span>
-        \${call.contextReset ? '<span class="call-reset">[R]</span>' : ''}
-      </div>
-      <div class="call-detail">
-        \${call.contextReset ? '<div class="reset-banner">⚠ Context reset</div>' : ''}
-        \${diffHtml || '<span style="color:#ccc;font-size:11px">(no diff)</span>'}
-        <div class="call-meta">
-          <span>model: \${esc(call.model)}</span>
-          <span>out: \${fmtTok(call.outputTokens)}</span>
-          <span>cache: \${fmtTok(call.cacheTokens)}</span>
-        </div>
-      </div>
-    </div>\`;
+    return \`<div class="ci">
+  <div class="ch" onclick="toggleCall(this.parentElement)">
+    <span class="cn">#\${call.idx}</span>
+    <span class="ct">\${fmtTime(call.ts)}</span>
+    <span class="cm">\${call.msgCount} msgs</span>
+    <span class="ck">\${fmtTok(call.inTok)} in</span>
+    <span class="cd">\${fmtDur(call.durMs)}</span>
+    \${call.reset?'<span class="cr">[R]</span>':''}
+  </div>
+  <div class="ca">
+    \${call.reset?'<div class="rb">⚠ Context reset</div>':''}
+    \${diffHtml||'<span style="color:#484f58;font-size:11px">(no diff)</span>'}
+    <div class="dm">
+      <span>out: \${fmtTok(call.outTok)}</span>
+      <span>cache: \${fmtTok(call.cacheTok)}</span>
+      <span>\${esc(call.model)}</span>
+    </div>
+  </div>
+</div>\`;
   }).join('');
 }
 
-function toggleCall(el) {
-  el.classList.toggle('open');
-}
+function toggleCall(el) { el.classList.toggle('open'); }
 
-document.getElementById('detail-close').addEventListener('click', () => {
-  document.getElementById('detail-panel').classList.remove('visible');
-  document.querySelectorAll('.node-box.selected').forEach(el => el.classList.remove('selected'));
+document.getElementById('dclose').addEventListener('click', () => {
+  document.getElementById('detail').classList.remove('open');
+  if(activeEl){ activeEl.classList.remove('active'); activeEl=null; }
 });
 
-// auto-open root
-const rootRect = nodesG.querySelector('.node-box');
-if (rootRect) selectNode(TREE, rootRect);
+// ─── pan + zoom ───────────────────────────────────────────────────────────────
+const vp = document.getElementById('viewport');
+const canvas = document.getElementById('canvas');
+let scale=1, tx=80, ty=40;
 
-// ─── utils ────────────────────────────────────────────────────────────────────
-
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function applyT() {
+  canvas.style.transform=\`translate(\${tx}px,\${ty}px) scale(\${scale})\`;
+  document.getElementById('zoom').textContent='zoom: '+Math.round(scale*100)+'% · scroll=zoom · drag=pan';
 }
+applyT();
+
+vp.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = e.deltaY<0?1.1:0.9;
+  const r = vp.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  tx = mx-(mx-tx)*f; ty = my-(my-ty)*f; scale*=f;
+  applyT();
+}, {passive:false});
+
+let drag=false,dsx,dsy,dtx,dty;
+vp.addEventListener('mousedown', e=>{drag=true;dsx=e.clientX;dsy=e.clientY;dtx=tx;dty=ty;});
+window.addEventListener('mousemove', e=>{if(!drag)return;tx=dtx+(e.clientX-dsx);ty=dty+(e.clientY-dsy);applyT();});
+window.addEventListener('mouseup', ()=>{drag=false;});
 </script>
 </body>
 </html>`;
 }
-// ─── public API ───────────────────────────────────────────────────────────────
 function generateReport(root, sessionId) {
     const html = buildHtml(root, sessionId);
     const outDir = path.join(shared_1.TRACER_DIR, 'sessions', sessionId);

@@ -1,11 +1,36 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildCallTree = buildCallTree;
-// Fingerprint: first 200 chars of system prompt (or full if shorter)
+// ─── system prompt helpers ────────────────────────────────────────────────────
+// Anthropic API allows system as array of content blocks; proxy stores as JSON.stringify'd
+function extractSystemText(raw) {
+    if (!raw)
+        return '';
+    const s = String(raw);
+    if (s.trimStart().startsWith('[')) {
+        try {
+            const blocks = JSON.parse(s);
+            return blocks
+                .filter(b => b['type'] === 'text')
+                .map(b => String(b['text'] ?? ''))
+                .join('\n');
+        }
+        catch { /* fall through */ }
+    }
+    return s;
+}
+// Fingerprint: skip first 200 chars (may contain dynamic date/time/session info),
+// use next 400 chars of extracted text (stable tool definitions, instructions, etc.)
 function fingerprint(system) {
     if (!system)
         return '__no_system__';
-    return system.slice(0, 200);
+    const text = extractSystemText(system);
+    if (text.length < 50)
+        return text || '__empty__';
+    // Use a window from the stable middle of the prompt
+    const start = Math.min(200, Math.floor(text.length * 0.1));
+    const end = Math.min(start + 400, text.length);
+    return text.slice(start, end);
 }
 function computeStats(calls) {
     let totalInputTokens = 0;
@@ -18,43 +43,39 @@ function computeStats(calls) {
             totalCacheReadTokens += c.usage.cache_read_input_tokens ?? 0;
         }
     }
+    // Fallback: use input_token_total from last call if per-call usage is 0
+    if (totalInputTokens === 0 && calls.length) {
+        const lastTotal = calls[calls.length - 1].input_token_total;
+        if (lastTotal && lastTotal > 0)
+            totalInputTokens = lastTotal;
+    }
     const firstTs = calls[0]?.ts ?? '';
     const lastTs = calls[calls.length - 1]?.ts ?? '';
     const durationMs = calls.length >= 2
         ? new Date(lastTs).getTime() - new Date(firstTs).getTime() + (calls[calls.length - 1]?.duration_ms ?? 0)
         : (calls[0]?.duration_ms ?? 0);
-    return {
-        totalInputTokens,
-        totalOutputTokens,
-        totalCacheReadTokens,
-        callCount: calls.length,
-        firstTs,
-        lastTs,
-        durationMs,
-    };
+    return { totalInputTokens, totalOutputTokens, totalCacheReadTokens, callCount: calls.length, firstTs, lastTs, durationMs };
 }
-// Extract a human-readable label from system prompt
 function extractLabel(system, isRoot) {
     if (isRoot)
         return 'main session';
     if (!system)
         return '(no system prompt)';
-    const lines = system.split('\n').map((l) => l.trim()).filter(Boolean);
+    const text = extractSystemText(system);
+    // Find first non-empty, non-JSON, human-readable line
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('{') && !l.startsWith('['));
     const label = lines[0] ?? '(subagent)';
     return label.length > 60 ? label.slice(0, 60) + '\u2026' : label;
 }
 function buildCallTree(calls) {
     if (calls.length === 0) {
         return {
-            id: 'empty',
-            systemSnippet: '',
-            label: 'empty session',
-            calls: [],
-            children: [],
+            id: 'empty', systemSnippet: '', label: 'empty session',
+            calls: [], children: [],
             stats: { totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, callCount: 0, firstTs: '', lastTs: '', durationMs: 0 },
         };
     }
-    // Step 1: Group calls by system prompt fingerprint
+    // Step 1: Group by fingerprint
     const groups = new Map();
     for (const call of calls) {
         const fp = fingerprint(call.system);
@@ -62,72 +83,57 @@ function buildCallTree(calls) {
             groups.set(fp, []);
         groups.get(fp).push(call);
     }
-    // Step 2: Find root group — prefer group containing the very first call
-    const firstCallFp = fingerprint(calls[0].system);
-    let rootFp = firstCallFp;
-    let maxCalls = 0;
-    for (const [fp, grpCalls] of groups.entries()) {
-        if (grpCalls.length > maxCalls) {
-            maxCalls = grpCalls.length;
+    // Step 2: Root = group containing first call (or largest group on tie)
+    const firstFp = fingerprint(calls[0].system);
+    let rootFp = firstFp;
+    for (const [fp, gc] of groups.entries()) {
+        if (gc.length > (groups.get(rootFp)?.length ?? 0))
             rootFp = fp;
-        }
     }
-    // If tie, prefer the group containing the very first call
-    if ((groups.get(firstCallFp)?.length ?? 0) >= (groups.get(rootFp)?.length ?? 0)) {
-        rootFp = firstCallFp;
-    }
-    // Step 3: For each non-root group, find its parent call by timestamp overlap
-    const rootCalls = groups.get(rootFp);
-    const rootCallsSorted = [...rootCalls].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+    if ((groups.get(firstFp)?.length ?? 0) >= (groups.get(rootFp)?.length ?? 0))
+        rootFp = firstFp;
+    // Step 3: Assign parent by timestamp overlap with root calls
+    const rootSorted = [...(groups.get(rootFp) ?? [])].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
     const groupMeta = new Map();
-    for (const [fp, grpCalls] of groups.entries()) {
+    for (const [fp, gc] of groups.entries()) {
         if (fp === rootFp)
             continue;
-        const firstChildTs = new Date(grpCalls[0].ts).getTime();
-        // Find the parent call: last root call at or before this child's first call
+        const childStart = new Date(gc[0].ts).getTime();
         let parentCall;
-        for (let i = rootCallsSorted.length - 1; i >= 0; i--) {
-            const rc = rootCallsSorted[i];
-            if (new Date(rc.ts).getTime() <= firstChildTs) {
-                parentCall = rc;
+        for (let i = rootSorted.length - 1; i >= 0; i--) {
+            if (new Date(rootSorted[i].ts).getTime() <= childStart) {
+                parentCall = rootSorted[i];
                 break;
             }
         }
-        if (parentCall) {
-            groupMeta.set(fp, { parentCallIndex: parentCall.call_index, parentGroupId: rootFp });
-        }
-        else {
-            // Orphan — attach to root
-            groupMeta.set(fp, {});
-        }
+        groupMeta.set(fp, parentCall
+            ? { parentCallIndex: parentCall.call_index, parentGroupId: rootFp }
+            : {});
     }
-    // Step 4: Build ConversationGroup objects
-    const groupObjects = new Map();
-    for (const [fp, grpCalls] of groups.entries()) {
-        const isRoot = fp === rootFp;
+    // Step 4: Build objects
+    const objs = new Map();
+    for (const [fp, gc] of groups.entries()) {
+        const sorted = [...gc].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
         const meta = groupMeta.get(fp) ?? {};
-        const sortedCalls = [...grpCalls].sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
-        groupObjects.set(fp, {
-            id: fp,
+        objs.set(fp, {
+            id: fp.slice(0, 40),
             systemSnippet: fp.slice(0, 80),
-            label: extractLabel(grpCalls[0].system, isRoot),
-            calls: sortedCalls,
+            label: extractLabel(gc[0].system, fp === rootFp),
+            calls: sorted,
             parentCallIndex: meta.parentCallIndex,
             parentGroupId: meta.parentGroupId,
             children: [],
-            stats: computeStats(sortedCalls),
+            stats: computeStats(sorted),
         });
     }
-    // Step 5: Wire children into parent.children[]
-    const root = groupObjects.get(rootFp);
-    for (const [fp, group] of groupObjects.entries()) {
+    // Step 5: Wire parent → children
+    const root = objs.get(rootFp);
+    for (const [fp, g] of objs.entries()) {
         if (fp === rootFp)
             continue;
-        const parentFp = group.parentGroupId;
-        const parent = parentFp ? groupObjects.get(parentFp) : undefined;
-        (parent ?? root).children.push(group);
+        const parent = g.parentGroupId ? objs.get(g.parentGroupId) : undefined;
+        (parent ?? root).children.push(g);
     }
-    // Sort children by firstTs
     function sortChildren(g) {
         g.children.sort((a, b) => new Date(a.stats.firstTs).getTime() - new Date(b.stats.firstTs).getTime());
         g.children.forEach(sortChildren);
