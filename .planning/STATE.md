@@ -2,9 +2,9 @@
 
 ## Current Position
 
-Phase: Phase 1 complete — proxy daemon + CLI working
-Status: proxy daemon running, CLI start/stop/status verified, npm link global install done
-Last activity: 2026-03-06 — Plan 01-02 complete
+Phase: Phase 2 in progress — 02-01 complete, starting 02-02
+Status: diff engine live, context-reset guard + input_token_total tracking in logger
+Last activity: 2026-03-06 — Plan 02-01 complete
 
 ## Progress
 
