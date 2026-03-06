@@ -40,6 +40,9 @@ const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const shared_1 = require("./shared");
 const watch_1 = require("./watch");
+const readline = __importStar(require("readline"));
+const graph_1 = require("./graph");
+const report_1 = require("./report");
 const PID_FILE = path.join(shared_1.TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
 const SEP = '─'.repeat(49);
@@ -235,6 +238,91 @@ program
     .description('Open live two-panel TUI (timeline + diff detail)')
     .action((sessionId) => {
     (0, watch_1.startWatch)(sessionId);
+});
+function openBrowser(filePath) {
+    const url = `file://${filePath}`;
+    const cmd = process.platform === 'darwin' ? 'open'
+        : process.platform === 'win32' ? 'start'
+            : 'xdg-open';
+    child_process.exec(`${cmd} "${url}"`, (err) => {
+        if (err) {
+            console.log(`Could not auto-open. Open manually:\n  ${url}`);
+        }
+    });
+}
+async function pickSession() {
+    const sessions = (0, shared_1.listSessions)();
+    if (sessions.length === 0)
+        return null;
+    if (sessions.length === 1)
+        return sessions[0];
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    console.log('\nAvailable sessions:\n');
+    sessions.forEach((s, i) => {
+        const calls = (0, shared_1.readCalls)(s);
+        const tokens = calls.length ? (calls[calls.length - 1].input_token_total ?? 0) : 0;
+        console.log(`  ${i + 1}. ${s}  (${calls.length} calls, ${(0, shared_1.fmt)(tokens)} tok)`);
+    });
+    console.log('');
+    return new Promise((resolve) => {
+        rl.question('Select session number: ', (answer) => {
+            rl.close();
+            const idx = parseInt(answer.trim(), 10) - 1;
+            if (idx >= 0 && idx < sessions.length) {
+                resolve(sessions[idx]);
+            }
+            else {
+                console.error('Invalid selection.');
+                resolve(null);
+            }
+        });
+    });
+}
+function countGroupsHelper(g) {
+    return 1 + g.children.reduce((s, c) => s + countGroupsHelper(c), 0);
+}
+// report
+program
+    .command('report [session_id]')
+    .description('Generate HTML call-tree report and open in browser')
+    .option('--regen', 'Regenerate even if report.html already exists')
+    .action(async (sessionId, options) => {
+    // Resolve session
+    let sid = sessionId;
+    if (!sid) {
+        const picked = await pickSession();
+        sid = picked ?? undefined;
+    }
+    if (!sid) {
+        console.error('No sessions found. Run: claude-tracer start && ANTHROPIC_BASE_URL=http://localhost:7749 claude');
+        process.exit(1);
+    }
+    const sessions = (0, shared_1.listSessions)();
+    if (!sessions.includes(sid)) {
+        console.error(`Session not found: ${sid}`);
+        console.error('Available:\n' + sessions.join('\n'));
+        process.exit(1);
+    }
+    const reportPath = path.join(shared_1.TRACER_DIR, 'sessions', sid, 'report.html');
+    // If already generated and --regen not set, just open
+    if (fs.existsSync(reportPath) && !options.regen) {
+        console.log(`Report already exists: ${reportPath}`);
+        console.log('Opening in browser... (use --regen to regenerate)');
+        openBrowser(reportPath);
+        return;
+    }
+    // Generate
+    console.log(`Generating report for ${sid}...`);
+    const calls = (0, shared_1.readCalls)(sid);
+    if (calls.length === 0) {
+        console.error('No calls found in this session.');
+        process.exit(1);
+    }
+    const tree = (0, graph_1.buildCallTree)(calls);
+    const outPath = (0, report_1.generateReport)(tree, sid);
+    console.log(`Report generated: ${outPath}`);
+    console.log(`Conversation groups detected: ${countGroupsHelper(tree)}`);
+    openBrowser(outPath);
 });
 program.parse(process.argv);
 //# sourceMappingURL=cli.js.map

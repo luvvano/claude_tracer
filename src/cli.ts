@@ -6,6 +6,10 @@ import * as path from 'path';
 import { DaemonState } from './types';
 import { TRACER_DIR, readCalls, listSessions, fmt, fmtTime, fmtDate, diffLine } from './shared';
 import { startWatch } from './watch';
+import * as readline from 'readline';
+import { ConversationGroup } from './types';
+import { buildCallTree } from './graph';
+import { generateReport } from './report';
 
 const PID_FILE = path.join(TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
@@ -150,6 +154,101 @@ program
   .description('Open live two-panel TUI (timeline + diff detail)')
   .action((sessionId?: string) => {
     startWatch(sessionId);
+  });
+
+function openBrowser(filePath: string): void {
+  const url = `file://${filePath}`;
+  const cmd = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  child_process.exec(`${cmd} "${url}"`, (err) => {
+    if (err) {
+      console.log(`Could not auto-open. Open manually:\n  ${url}`);
+    }
+  });
+}
+
+async function pickSession(): Promise<string | null> {
+  const sessions = listSessions();
+  if (sessions.length === 0) return null;
+  if (sessions.length === 1) return sessions[0];
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log('\nAvailable sessions:\n');
+  sessions.forEach((s, i) => {
+    const calls = readCalls(s);
+    const tokens = calls.length ? (calls[calls.length - 1].input_token_total ?? 0) : 0;
+    console.log(`  ${i + 1}. ${s}  (${calls.length} calls, ${fmt(tokens)} tok)`);
+  });
+  console.log('');
+
+  return new Promise((resolve) => {
+    rl.question('Select session number: ', (answer) => {
+      rl.close();
+      const idx = parseInt(answer.trim(), 10) - 1;
+      if (idx >= 0 && idx < sessions.length) {
+        resolve(sessions[idx]);
+      } else {
+        console.error('Invalid selection.');
+        resolve(null);
+      }
+    });
+  });
+}
+
+function countGroupsHelper(g: ConversationGroup): number {
+  return 1 + g.children.reduce((s: number, c: ConversationGroup) => s + countGroupsHelper(c), 0);
+}
+
+// report
+program
+  .command('report [session_id]')
+  .description('Generate HTML call-tree report and open in browser')
+  .option('--regen', 'Regenerate even if report.html already exists')
+  .action(async (sessionId: string | undefined, options: { regen?: boolean }) => {
+    // Resolve session
+    let sid = sessionId;
+    if (!sid) {
+      const picked = await pickSession();
+      sid = picked ?? undefined;
+    }
+    if (!sid) {
+      console.error('No sessions found. Run: claude-tracer start && ANTHROPIC_BASE_URL=http://localhost:7749 claude');
+      process.exit(1);
+    }
+
+    const sessions = listSessions();
+    if (!sessions.includes(sid)) {
+      console.error(`Session not found: ${sid}`);
+      console.error('Available:\n' + sessions.join('\n'));
+      process.exit(1);
+    }
+
+    const reportPath = path.join(TRACER_DIR, 'sessions', sid, 'report.html');
+
+    // If already generated and --regen not set, just open
+    if (fs.existsSync(reportPath) && !options.regen) {
+      console.log(`Report already exists: ${reportPath}`);
+      console.log('Opening in browser... (use --regen to regenerate)');
+      openBrowser(reportPath);
+      return;
+    }
+
+    // Generate
+    console.log(`Generating report for ${sid}...`);
+    const calls = readCalls(sid);
+    if (calls.length === 0) {
+      console.error('No calls found in this session.');
+      process.exit(1);
+    }
+
+    const tree = buildCallTree(calls);
+    const outPath = generateReport(tree, sid);
+
+    console.log(`Report generated: ${outPath}`);
+    console.log(`Conversation groups detected: ${countGroupsHelper(tree)}`);
+    openBrowser(outPath);
   });
 
 program.parse(process.argv);
