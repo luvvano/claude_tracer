@@ -1,14 +1,24 @@
 # Roadmap: Claude Tracer
 
-## Milestone: v1.0
+## Milestone: v1.0 — COMPLETE
 
 **Goal:** Full observability for Claude Code sessions — tool events via hooks, full prompt capture via API proxy, live TUI in a second pane.
 
 ## Phases
 
-- [ ] **Phase 1: Foundation** — Plugin scaffold, hook scripts, daemon skeleton, JSONL storage. Hooks fire and events land on disk.
-- [ ] **Phase 2: Proxy & Prompt Capture** — API proxy intercepts Anthropic calls, captures messages[], computes diffs, logs tokens.
-- [ ] **Phase 3: Terminal UI** — `claude-tracer watch` live two-panel TUI with event timeline and prompt diff view.
+- [x] **Phase 1: Foundation** — Proxy daemon, JSONL storage, CLI start/stop/status.
+- [x] **Phase 2: Proxy & Prompt Capture** — messages[], diffs, token counts, show/diff CLI.
+- [x] **Phase 3: Terminal UI** — `claude-tracer watch` live two-panel TUI.
+
+---
+
+## Milestone: v1.1
+
+**Goal:** Session call-tree visualization — HTML report showing parent session + subagents as an interactive tree, like Go's pprof.
+
+## Phases
+
+- [ ] **Phase 4: Session Graph Report** — `claude-tracer report [session_id]` generates an interactive HTML call-tree from calls.jsonl; opens in browser.
 
 ---
 
