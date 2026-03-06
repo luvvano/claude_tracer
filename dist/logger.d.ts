@@ -5,6 +5,8 @@ export declare class SessionLogger {
     private sessionDir;
     private callsFile;
     private callIndex;
+    private previousMessages;
+    private inputTokenTotal;
     constructor(sessionId: string);
     writeCall(record: Omit<CallRecord, 'call_index'>): void;
     getCallCount(): number;

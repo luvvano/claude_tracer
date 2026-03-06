@@ -1,3 +1,10 @@
+export interface DiffEntry {
+    index: number;
+    role: string;
+    content_summary: string;
+    is_tool_use: boolean;
+    tool_name?: string;
+}
 export interface CallRecord {
     ts: string;
     call_index: number;
@@ -6,6 +13,9 @@ export interface CallRecord {
     messages: unknown[];
     usage: UsageRecord | null;
     duration_ms: number;
+    diff?: DiffEntry[];
+    context_reset?: boolean;
+    input_token_total?: number;
 }
 export interface UsageRecord {
     input_tokens?: number;
