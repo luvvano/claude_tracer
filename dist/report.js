@@ -50,113 +50,45 @@ function fmtDuration(ms) {
 function escHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-// ─── call detail HTML ─────────────────────────────────────────────────────────
-function renderCallDetail(call) {
-    const lines = [];
-    if (call.context_reset) {
-        lines.push(`<div class="reset-banner">⚠ CONTEXT RESET — all messages are new</div>`);
-    }
-    const diffEntries = (call.diff ?? []);
-    if (diffEntries.length === 0) {
-        lines.push(`<p class="muted">(no diff data — first call or baseline)</p>`);
-    }
-    else {
-        for (const e of diffEntries) {
-            let content = '';
-            if (e.is_tool_use && e.tool_name) {
-                const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
-                content = `<span class="tool-badge">${escHtml(e.tool_name)}${m ? ' → ' + escHtml(m[1]) : ''}</span>`;
-            }
-            else if (e.content_summary.includes('"type":"tool_result"') ||
-                e.content_summary.includes('"type": "tool_result"')) {
-                const lenMatch = e.content_summary.match(/"content"\s*:\s*"([^"]*)"/);
-                const chars = lenMatch ? lenMatch[1].length : 0;
-                content = `<span class="tool-result-badge">tool_result${chars ? ': ' + chars + ' chars' : ''}</span>`;
-            }
-            else {
-                const summary = escHtml(e.content_summary.replace(/\n/g, ' ').slice(0, 500));
-                content = `<span class="msg-content">${summary}${e.content_summary.length > 500 ? '…' : ''}</span>`;
-            }
-            lines.push(`<div class="diff-entry role-${e.role}"><span class="role-tag">${escHtml(e.role)}</span>${content}</div>`);
-        }
-    }
-    lines.push(`<div class="call-meta">`);
-    lines.push(`<span>Model: ${escHtml(call.model)}</span>`);
-    lines.push(`<span>Duration: ${fmtDuration(call.duration_ms)}</span>`);
-    if (call.usage) {
-        lines.push(`<span>In: ${(0, shared_1.fmt)(call.usage.input_tokens ?? 0)} tok</span>`);
-        lines.push(`<span>Out: ${(0, shared_1.fmt)(call.usage.output_tokens ?? 0)} tok</span>`);
-        if ((call.usage.cache_read_input_tokens ?? 0) > 0) {
-            lines.push(`<span>Cache: ${(0, shared_1.fmt)(call.usage.cache_read_input_tokens)} tok</span>`);
-        }
-    }
-    lines.push(`</div>`);
-    return lines.join('\n');
+function escJs(s) {
+    return s.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
 }
-// ─── call row HTML ────────────────────────────────────────────────────────────
-function renderCallRow(call, groupIndex, callIndex) {
-    const msgCount = call.messages.length;
-    const inputTok = call.usage?.input_tokens ?? 0;
-    const resetFlag = call.context_reset ? '<span class="reset-flag" title="Context reset">[R]</span>' : '';
-    const detailId = `detail-${groupIndex}-${callIndex}`;
-    return `
-<div class="call-row" onclick="toggleDetail('${detailId}')">
-  <span class="call-index">#${call.call_index}</span>
-  <span class="call-time">${(0, shared_1.fmtTime)(call.ts)}</span>
-  <span class="call-msgs">${msgCount} msgs</span>
-  <span class="call-tokens">${(0, shared_1.fmt)(inputTok)} in</span>
-  <span class="call-dur">${fmtDuration(call.duration_ms)}</span>
-  ${resetFlag}
-  <span class="expand-arrow">▸</span>
-</div>
-<div class="call-detail" id="${detailId}">
-  ${renderCallDetail(call)}
-</div>`;
+function serializeGroup(g) {
+    return {
+        id: g.id.slice(0, 40),
+        label: g.label,
+        callCount: g.stats.callCount,
+        inputTokens: g.stats.totalInputTokens,
+        outputTokens: g.stats.totalOutputTokens,
+        durationMs: g.stats.durationMs,
+        children: g.children.map(serializeGroup),
+        calls: g.calls.map(c => ({
+            callIndex: c.call_index,
+            ts: c.ts,
+            msgCount: c.messages.length,
+            inputTokens: c.usage?.input_tokens ?? 0,
+            outputTokens: c.usage?.output_tokens ?? 0,
+            cacheTokens: c.usage?.cache_read_input_tokens ?? 0,
+            durationMs: c.duration_ms,
+            model: c.model,
+            contextReset: c.context_reset ?? false,
+            diff: (c.diff ?? []).map(e => ({
+                role: e.role,
+                isToolUse: e.is_tool_use,
+                toolName: e.tool_name,
+                contentSummary: e.content_summary.slice(0, 500),
+            })),
+        })),
+    };
 }
-// ─── group node HTML (recursive) ─────────────────────────────────────────────
-function renderGroup(group, depth, groupIndex) {
-    const myIndex = groupIndex.value++;
-    const nodeId = `group-${myIndex}`;
-    const depthClass = `depth-${Math.min(depth, 5)}`;
-    const callsHtml = group.calls
-        .map((c, i) => renderCallRow(c, myIndex, i))
-        .join('\n');
-    const childrenHtml = group.children
-        .map(child => renderGroup(child, depth + 1, groupIndex))
-        .join('\n');
-    return `
-<div class="group-node ${depthClass}" id="${nodeId}">
-  <div class="group-header" onclick="toggleGroup('${nodeId}')">
-    <span class="group-toggle">▶</span>
-    <span class="group-label">${escHtml(group.label)}</span>
-    <span class="group-stats">
-      ${group.stats.callCount} call${group.stats.callCount !== 1 ? 's' : ''} ·
-      ${(0, shared_1.fmt)(group.stats.totalInputTokens)} in tok ·
-      ${fmtDuration(group.stats.durationMs)}
-    </span>
-  </div>
-  <div class="group-body">
-    <div class="calls-list">
-      ${callsHtml}
-    </div>
-    ${childrenHtml}
-  </div>
-</div>`;
-}
-// ─── sum tokens recursively ───────────────────────────────────────────────────
 function sumTokens(g) {
     return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTokens(c), 0);
 }
-function countGroups(g) {
-    return 1 + g.children.reduce((s, c) => s + countGroups(c), 0);
-}
-// ─── full HTML document ───────────────────────────────────────────────────────
+// ─── HTML document ────────────────────────────────────────────────────────────
 function buildHtml(root, sessionId) {
-    const groupIndex = { value: 0 };
-    const treeHtml = renderGroup(root, 0, groupIndex);
-    const generatedAt = new Date().toISOString();
+    const treeData = JSON.stringify(serializeGroup(root));
     const totalTok = sumTokens(root);
-    const totalGroups = countGroups(root);
+    const generatedAt = new Date().toISOString();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -164,316 +96,421 @@ function buildHtml(root, sessionId) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>claude-tracer: ${escHtml(sessionId)}</title>
 <style>
-/* claude-tracer — pprof-style dark call-tree report */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-html { scroll-behavior: smooth; }
-
+* { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
   font-size: 13px;
-  background: #0d1117;
-  color: #c9d1d9;
-  padding: 16px;
-  min-height: 100vh;
-  line-height: 1.5;
-}
-
-/* Custom scrollbar */
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: #161b22; }
-::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #484f58; }
-
-/* Selection */
-::selection { background: #1f6feb55; color: #e6edf3; }
-
-.page-header {
-  border-bottom: 1px solid #30363d;
-  padding-bottom: 12px;
-  margin-bottom: 20px;
-}
-
-.page-header h1 {
-  font-size: 18px;
-  color: #58a6ff;
-  font-weight: 600;
-}
-
-.page-header .meta {
-  color: #8b949e;
-  font-size: 12px;
-  margin-top: 6px;
+  background: #f8f8f8;
+  color: #111;
+  height: 100vh;
   display: flex;
+  flex-direction: column;
+}
+#header {
+  background: #fff;
+  border-bottom: 1px solid #ddd;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
   gap: 20px;
-  flex-wrap: wrap;
+  flex-shrink: 0;
 }
-
-/* Group nodes */
-.group-node {
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  margin: 6px 0;
-  overflow: hidden;
-}
-
-.group-node.depth-0 { border-color: #1f6feb; }
-.group-node.depth-1 { border-color: #388bfd; margin-left: 24px; }
-.group-node.depth-2 { border-color: #6e40c9; margin-left: 48px; }
-.group-node.depth-3 { border-color: #8957e5; margin-left: 72px; }
-.group-node.depth-4 { border-color: #bc8cff; margin-left: 96px; }
-.group-node.depth-5 { border-color: #d2a8ff; margin-left: 120px; }
-
-.group-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  cursor: pointer;
-  user-select: none;
-  background: #161b22;
-  transition: background 0.15s;
-}
-
-.group-node.depth-0 .group-header { background: #0d2045; }
-.group-node.depth-1 .group-header { background: #0e1f3d; }
-.group-node.depth-2 .group-header { background: #1a0e3d; }
-.group-node.depth-3 .group-header { background: #200e3d; }
-
-.group-header:hover { filter: brightness(1.2); }
-
-.group-toggle {
-  font-size: 10px;
-  color: #8b949e;
-  transition: transform 0.15s;
-  min-width: 12px;
-}
-
-.group-node.open > .group-header .group-toggle {
-  transform: rotate(90deg);
-}
-
-.group-label {
-  color: #e6edf3;
-  font-weight: 600;
+#header h1 { font-size: 14px; font-weight: 700; color: #1a6cf5; }
+#header .meta { font-size: 11px; color: #888; }
+#main { display: flex; flex: 1; overflow: hidden; }
+#graph-container {
   flex: 1;
-  white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  position: relative;
+  background: #fafafa;
+  cursor: grab;
 }
-
-.group-stats {
-  color: #8b949e;
-  font-size: 11px;
-  white-space: nowrap;
+#graph-container:active { cursor: grabbing; }
+#svg-wrap {
+  position: absolute;
+  top: 0; left: 0;
+  transform-origin: 0 0;
 }
-
-.group-body {
-  display: none;
-  padding: 8px;
-  background: #010409;
-}
-
-.group-node.open > .group-body { display: block; }
-
-/* Call rows */
-.calls-list { margin-bottom: 4px; }
-
-.call-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 5px 8px;
+svg text { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+.node-box {
+  fill: #fff;
+  stroke: #555;
+  stroke-width: 1.5;
+  rx: 4;
   cursor: pointer;
-  border-radius: 4px;
-  transition: background 0.1s;
 }
-
-.call-row:hover { background: #161b22; }
-
-.call-index  { color: #8b949e; min-width: 36px; }
-.call-time   { color: #3fb950; min-width: 62px; }
-.call-msgs   { color: #79c0ff; min-width: 54px; }
-.call-tokens { color: #e3b341; min-width: 82px; }
-.call-dur    { color: #8b949e; min-width: 54px; }
-.reset-flag  { color: #f85149; font-weight: bold; }
-.expand-arrow { color: #484f58; margin-left: auto; font-size: 10px; transition: transform 0.15s; }
-.call-row.open .expand-arrow { transform: rotate(90deg); }
-
-/* Call detail */
-.call-detail {
+.node-box:hover { stroke: #1a6cf5; stroke-width: 2; }
+.node-box.selected { stroke: #1a6cf5; stroke-width: 2.5; fill: #eef4ff; }
+.node-label { font-size: 12px; font-weight: 700; fill: #111; }
+.node-stat  { font-size: 11px; fill: #444; }
+.node-pct   { font-size: 10px; fill: #888; }
+.edge { fill: none; stroke: #999; stroke-width: 1.5; marker-end: url(#arrow); }
+.edge-label { font-size: 10px; fill: #999; }
+#detail-panel {
+  width: 340px;
+  border-left: 1px solid #ddd;
+  background: #fff;
+  overflow-y: auto;
+  flex-shrink: 0;
   display: none;
-  padding: 8px 12px;
-  border-left: 2px solid #30363d;
-  margin: 0 8px 6px 36px;
-  background: #0d1117;
-  border-radius: 0 4px 4px 0;
 }
-
-.call-detail.open { display: block; }
-
-.diff-entry {
+#detail-panel.visible { display: block; }
+#detail-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid #eee;
+  font-weight: 700;
+  font-size: 13px;
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 3px 0;
-  border-bottom: 1px solid #21262d;
+  justify-content: space-between;
+  align-items: center;
 }
-
-.diff-entry:last-of-type { border-bottom: none; }
-
-.role-tag {
-  min-width: 70px;
-  font-weight: 600;
+#detail-close { cursor: pointer; color: #aaa; font-size: 16px; line-height: 1; }
+#detail-close:hover { color: #333; }
+.call-item {
+  border-bottom: 1px solid #f0f0f0;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+.call-item:hover { background: #f5f8ff; }
+.call-item.open { background: #eef4ff; }
+.call-row { display: flex; gap: 8px; align-items: center; font-size: 11px; }
+.call-idx  { color: #aaa; min-width: 28px; }
+.call-time { color: #2a9d3d; min-width: 56px; }
+.call-msgs { color: #1a6cf5; min-width: 44px; }
+.call-tok  { color: #e67e22; min-width: 72px; }
+.call-dur  { color: #aaa; }
+.call-reset { color: #e74c3c; font-weight: 700; margin-left: 4px; }
+.call-detail { display: none; padding: 6px 0 0 0; }
+.call-item.open .call-detail { display: block; }
+.diff-line {
   font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 3px;
-}
-
-.role-user .role-tag      { background: #0e4429; color: #3fb950; }
-.role-assistant .role-tag { background: #0d419d; color: #79c0ff; }
-
-.msg-content       { color: #c9d1d9; word-break: break-word; }
-.tool-badge        { background: #161b22; border: 1px solid #30363d; padding: 1px 6px; border-radius: 3px; color: #79c0ff; }
-.tool-result-badge { background: #161b22; border: 1px solid #30363d; padding: 1px 6px; border-radius: 3px; color: #8b949e; }
-
-.call-meta {
+  padding: 2px 0;
   display: flex;
-  gap: 14px;
-  margin-top: 8px;
-  padding-top: 6px;
-  border-top: 1px solid #21262d;
-  color: #8b949e;
-  font-size: 11px;
-  flex-wrap: wrap;
+  gap: 6px;
+  border-bottom: 1px solid #f5f5f5;
 }
-
-.reset-banner {
-  background: #3d0f0e;
-  color: #f85149;
+.diff-line:last-child { border-bottom: none; }
+.diff-role {
+  min-width: 64px;
   font-weight: 600;
-  padding: 4px 8px;
-  border-radius: 3px;
-  margin-bottom: 6px;
-}
-
-.muted { color: #484f58; font-style: italic; }
-
-.footer {
-  margin-top: 24px;
-  padding-top: 12px;
-  border-top: 1px solid #21262d;
-  color: #484f58;
-  font-size: 11px;
-}
-
-/* Focus states for keyboard navigation */
-.group-header:focus-visible,
-.call-row:focus-visible {
-  outline: 2px solid #1f6feb;
-  outline-offset: -2px;
-}
-
-/* Token count colors */
-.tok-low    { color: #3fb950; }
-.tok-medium { color: #e3b341; }
-.tok-high   { color: #f85149; }
-
-/* Inline code */
-code {
-  background: #161b22;
-  border: 1px solid #30363d;
-  border-radius: 3px;
   padding: 1px 4px;
-  font-size: 12px;
-  color: #79c0ff;
-}
-
-/* Nested group animation */
-.group-body {
-  transition: none;
-}
-
-/* Separator between call sections */
-.calls-list + .group-node {
-  margin-top: 8px;
-}
-
-/* Empty state */
-.empty-state {
-  color: #484f58;
-  font-style: italic;
-  padding: 12px 8px;
-  text-align: center;
-}
-
-/* Highlight on hover for diff entries */
-.diff-entry:hover {
-  background: #161b22;
-  border-radius: 3px;
-}
-
-/* Token badge */
-.tok-badge {
-  display: inline-block;
-  padding: 1px 5px;
-  border-radius: 3px;
+  border-radius: 2px;
   font-size: 10px;
-  font-weight: 600;
-  background: #21262d;
-  color: #e3b341;
 }
-
-/* Print styles */
-@media print {
-  body { background: #fff; color: #000; padding: 0; }
-  .group-node { border-color: #ccc !important; }
-  .group-header { background: #f5f5f5 !important; color: #000 !important; }
-  .group-body { display: block !important; }
-  .call-detail { display: block !important; }
-  .expand-arrow { display: none; }
-  .group-toggle { display: none; }
-}
+.diff-user .diff-role { background: #e8f9ed; color: #2a9d3d; }
+.diff-assistant .diff-role { background: #eef4ff; color: #1a6cf5; }
+.diff-content { color: #444; word-break: break-word; }
+.tool-badge { background: #f0f0f0; border: 1px solid #ddd; padding: 1px 5px; border-radius: 3px; color: #1a6cf5; font-size: 10px; }
+.tool-result-badge { background: #f0f0f0; border: 1px solid #ddd; padding: 1px 5px; border-radius: 3px; color: #888; font-size: 10px; }
+.call-meta { font-size: 10px; color: #aaa; padding-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+.reset-banner { background: #fef0ef; color: #e74c3c; font-weight: 600; padding: 3px 6px; border-radius: 3px; font-size: 11px; margin-bottom: 4px; }
+#hint { position: absolute; bottom: 10px; left: 10px; font-size: 11px; color: #bbb; pointer-events: none; }
 </style>
 </head>
 <body>
 
-<div class="page-header">
+<div id="header">
   <h1>⚡ claude-tracer: ${escHtml(sessionId)}</h1>
-  <div class="meta">
-    <span>Generated: ${generatedAt}</span>
-    <span>Total input tokens (all groups): ${(0, shared_1.fmt)(totalTok)}</span>
-    <span>Conversation groups: ${totalGroups}</span>
+  <span class="meta">Generated: ${generatedAt}</span>
+  <span class="meta">Total input tokens: ${(0, shared_1.fmt)(totalTok)}</span>
+  <span class="meta" id="zoom-label">zoom: 100%</span>
+</div>
+
+<div id="main">
+  <div id="graph-container">
+    <div id="svg-wrap">
+      <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#999"/>
+          </marker>
+        </defs>
+        <g id="edges"></g>
+        <g id="nodes"></g>
+      </svg>
+    </div>
+    <div id="hint">scroll to zoom · drag to pan · click node to inspect</div>
+  </div>
+  <div id="detail-panel">
+    <div id="detail-header">
+      <span id="detail-title">Calls</span>
+      <span id="detail-close">✕</span>
+    </div>
+    <div id="detail-body"></div>
   </div>
 </div>
 
-<div id="tree">
-${treeHtml}
-</div>
-
-<div class="footer">
-  Generated by claude-tracer · ${escHtml(sessionId)}
-</div>
-
 <script>
-function toggleGroup(id) {
-  const node = document.getElementById(id);
-  if (!node) return;
-  node.classList.toggle('open');
+const TREE = ${treeData};
+
+// ─── layout ───────────────────────────────────────────────────────────────────
+
+const NODE_W = 180;
+const NODE_H = 72;
+const H_GAP  = 40;
+const V_GAP  = 90;
+
+function subtreeWidth(node) {
+  if (!node.children.length) return NODE_W;
+  const childrenW = node.children.reduce((s, c) => s + subtreeWidth(c), 0)
+    + H_GAP * (node.children.length - 1);
+  return Math.max(NODE_W, childrenW);
 }
 
-function toggleDetail(id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  const row = el.previousElementSibling;
-  el.classList.toggle('open');
-  if (row) row.classList.toggle('open');
+function layout(node, x, y) {
+  node._x = x;
+  node._y = y;
+  if (!node.children.length) return;
+  const totalW = node.children.reduce((s, c) => s + subtreeWidth(c), 0)
+    + H_GAP * (node.children.length - 1);
+  let cx = x - totalW / 2 + subtreeWidth(node.children[0]) / 2;
+  for (const child of node.children) {
+    layout(child, cx, y + NODE_H + V_GAP);
+    cx += subtreeWidth(child) + H_GAP;
+  }
+  // center over children
+  if (node.children.length) {
+    const first = node.children[0];
+    const last  = node.children[node.children.length - 1];
+    node._x = (first._x + last._x) / 2;
+  }
 }
 
-document.addEventListener('DOMContentLoaded', function() {
-  const root = document.querySelector('.group-node.depth-0');
-  if (root) root.classList.add('open');
+function allNodes(node, out = []) {
+  out.push(node);
+  node.children.forEach(c => allNodes(c, out));
+  return out;
+}
+
+// ─── render ───────────────────────────────────────────────────────────────────
+
+const totalTok = (function sum(n) { return n.inputTokens + n.children.reduce((s,c) => s+sum(c), 0); })(TREE);
+
+function pct(val) {
+  if (!totalTok) return '0%';
+  return (val / totalTok * 100).toFixed(1) + '%';
+}
+
+function fmtTok(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function fmtDur(ms) {
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
+  return Math.floor(ms/60000) + 'm ' + Math.floor((ms%60000)/1000) + 's';
+}
+
+function fmtTime(ts) {
+  try { return new Date(ts).toTimeString().slice(0,8); } catch { return ts; }
+}
+
+layout(TREE, 0, 0);
+const nodes = allNodes(TREE);
+
+// compute bounding box
+const pad = 40;
+const xs = nodes.map(n => n._x);
+const ys = nodes.map(n => n._y);
+const minX = Math.min(...xs) - pad;
+const minY = Math.min(...ys) - pad;
+const maxX = Math.max(...xs) + NODE_W + pad;
+const maxY = Math.max(...ys) + NODE_H + pad;
+const svgW = maxX - minX;
+const svgH = maxY - minY;
+
+const svg = document.getElementById('graph-svg');
+svg.setAttribute('width', svgW);
+svg.setAttribute('height', svgH);
+
+const edgesG = document.getElementById('edges');
+const nodesG = document.getElementById('nodes');
+
+function mkSvg(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+// draw edges
+function drawEdges(node) {
+  for (const child of node.children) {
+    const x1 = node._x - minX + NODE_W/2;
+    const y1 = node._y - minY + NODE_H;
+    const x2 = child._x - minX + NODE_W/2;
+    const y2 = child._y - minY;
+    const mx = (x1 + x2) / 2;
+    const path = mkSvg('path', {
+      class: 'edge',
+      d: \`M\${x1},\${y1} C\${x1},\${mx} \${x2},\${mx} \${x2},\${y2}\`,
+    });
+    edgesG.appendChild(path);
+
+    // edge label: child call count
+    const lx = (x1 + x2) / 2;
+    const ly = (y1 + y2) / 2;
+    const lbl = mkSvg('text', { class: 'edge-label', x: lx + 4, y: ly, 'text-anchor': 'start' });
+    lbl.textContent = child.callCount + ' calls';
+    edgesG.appendChild(lbl);
+
+    drawEdges(child);
+  }
+}
+drawEdges(TREE);
+
+// draw nodes
+let selectedId = null;
+
+function drawNode(node) {
+  const nx = node._x - minX;
+  const ny = node._y - minY;
+  const g = mkSvg('g', { class: 'node-group', 'data-id': node.id });
+
+  const rect = mkSvg('rect', {
+    class: 'node-box',
+    x: nx, y: ny,
+    width: NODE_W, height: NODE_H,
+    rx: 4,
+  });
+  g.appendChild(rect);
+
+  // label (truncate)
+  const maxLabelLen = 22;
+  const labelText = node.label.length > maxLabelLen ? node.label.slice(0, maxLabelLen) + '…' : node.label;
+  const lbl = mkSvg('text', { class: 'node-label', x: nx + NODE_W/2, y: ny + 18, 'text-anchor': 'middle' });
+  lbl.textContent = labelText;
+  g.appendChild(lbl);
+
+  const s1 = mkSvg('text', { class: 'node-stat', x: nx + NODE_W/2, y: ny + 34, 'text-anchor': 'middle' });
+  s1.textContent = fmtTok(node.inputTokens) + ' in tok';
+  g.appendChild(s1);
+
+  const s2 = mkSvg('text', { class: 'node-pct', x: nx + NODE_W/2, y: ny + 48, 'text-anchor': 'middle' });
+  s2.textContent = pct(node.inputTokens) + ' of total · ' + fmtDur(node.durationMs);
+  g.appendChild(s2);
+
+  const s3 = mkSvg('text', { class: 'node-pct', x: nx + NODE_W/2, y: ny + 62, 'text-anchor': 'middle' });
+  s3.textContent = node.callCount + ' call' + (node.callCount !== 1 ? 's' : '');
+  g.appendChild(s3);
+
+  g.addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectNode(node, rect);
+  });
+
+  nodesG.appendChild(g);
+  node.children.forEach(drawNode);
+}
+drawNode(TREE);
+
+// ─── pan + zoom ────────────────────────────────────────────────────────────────
+
+const wrap = document.getElementById('svg-wrap');
+const container = document.getElementById('graph-container');
+let scale = 1, tx = 40, ty = 40;
+
+function applyTransform() {
+  wrap.style.transform = \`translate(\${tx}px, \${ty}px) scale(\${scale})\`;
+  document.getElementById('zoom-label').textContent = 'zoom: ' + Math.round(scale*100) + '%';
+}
+applyTransform();
+
+container.addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  const rect = container.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  tx = mx - (mx - tx) * factor;
+  ty = my - (my - ty) * factor;
+  scale *= factor;
+  applyTransform();
+}, { passive: false });
+
+let dragging = false, dragStartX, dragStartY, dragTx, dragTy;
+container.addEventListener('mousedown', e => {
+  dragging = true;
+  dragStartX = e.clientX; dragStartY = e.clientY;
+  dragTx = tx; dragTy = ty;
 });
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  tx = dragTx + (e.clientX - dragStartX);
+  ty = dragTy + (e.clientY - dragStartY);
+  applyTransform();
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+
+// ─── detail panel ─────────────────────────────────────────────────────────────
+
+function selectNode(node, rect) {
+  // deselect previous
+  document.querySelectorAll('.node-box.selected').forEach(el => el.classList.remove('selected'));
+  rect.classList.add('selected');
+
+  const panel = document.getElementById('detail-panel');
+  const title = document.getElementById('detail-title');
+  const body  = document.getElementById('detail-body');
+  panel.classList.add('visible');
+  title.textContent = node.label.length > 28 ? node.label.slice(0,28)+'…' : node.label;
+
+  body.innerHTML = node.calls.map((call, i) => {
+    const diffHtml = call.diff.map(e => {
+      let content = '';
+      if (e.isToolUse && e.toolName) {
+        const m = e.contentSummary.match(/"(?:path|file_path|command)"\\s*:\\s*"([^"]+)"/);
+        content = \`<span class="tool-badge">\${esc(e.toolName)}\${m ? ' → ' + esc(m[1]) : ''}</span>\`;
+      } else if (e.contentSummary.includes('"type":"tool_result"') || e.contentSummary.includes('"type": "tool_result"')) {
+        content = \`<span class="tool-result-badge">tool_result</span>\`;
+      } else {
+        const s = e.contentSummary.replace(/\\n/g,' ').slice(0,300);
+        content = \`<span class="diff-content">\${esc(s)}\${e.contentSummary.length>300?'…':''}</span>\`;
+      }
+      return \`<div class="diff-line diff-\${esc(e.role)}"><span class="diff-role">\${esc(e.role)}</span>\${content}</div>\`;
+    }).join('');
+
+    return \`<div class="call-item" onclick="toggleCall(this)">
+      <div class="call-row">
+        <span class="call-idx">#\${call.callIndex}</span>
+        <span class="call-time">\${fmtTime(call.ts)}</span>
+        <span class="call-msgs">\${call.msgCount} msgs</span>
+        <span class="call-tok">\${fmtTok(call.inputTokens)} in</span>
+        <span class="call-dur">\${fmtDur(call.durationMs)}</span>
+        \${call.contextReset ? '<span class="call-reset">[R]</span>' : ''}
+      </div>
+      <div class="call-detail">
+        \${call.contextReset ? '<div class="reset-banner">⚠ Context reset</div>' : ''}
+        \${diffHtml || '<span style="color:#ccc;font-size:11px">(no diff)</span>'}
+        <div class="call-meta">
+          <span>model: \${esc(call.model)}</span>
+          <span>out: \${fmtTok(call.outputTokens)}</span>
+          <span>cache: \${fmtTok(call.cacheTokens)}</span>
+        </div>
+      </div>
+    </div>\`;
+  }).join('');
+}
+
+function toggleCall(el) {
+  el.classList.toggle('open');
+}
+
+document.getElementById('detail-close').addEventListener('click', () => {
+  document.getElementById('detail-panel').classList.remove('visible');
+  document.querySelectorAll('.node-box.selected').forEach(el => el.classList.remove('selected'));
+});
+
+// auto-open root
+const rootRect = nodesG.querySelector('.node-box');
+if (rootRect) selectNode(TREE, rootRect);
+
+// ─── utils ────────────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 </script>
 </body>
 </html>`;
