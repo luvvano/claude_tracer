@@ -2,15 +2,16 @@
 
 ## Current Position
 
-Phase: v1.0 complete
-Status: All 3 phases verified and shipped
-Last activity: 2026-03-06 — Phase 3 verified (5/7, 2 gaps waived by owner)
+Phase: Phase 4 complete
+Status: Phase 4 complete — report command fully implemented, ready for verification
+Last activity: 2026-03-06 — Phase 4 implemented (call tree, HTML report, CLI integration)
 
 ## Progress
 
 - [x] Phase 1: Foundation
 - [x] Phase 2: Proxy & Prompt Capture
 - [x] Phase 3: Terminal UI
+- [x] Phase 4: Session Graph Report
 
 ## Key Decisions
 
