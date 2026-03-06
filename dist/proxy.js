@@ -89,7 +89,7 @@ function startProxy() {
             const upstreamReq = https.request(options, (upstreamRes) => {
                 res.writeHead(upstreamRes.statusCode ?? 200, upstreamRes.headers);
                 const isSSE = (upstreamRes.headers['content-type'] ?? '').includes('text/event-stream');
-                let usageData = null;
+                let usageData = {};
                 upstreamRes.on('data', (chunk) => {
                     res.write(chunk);
                     if (isSSE) {
@@ -103,8 +103,14 @@ function startProxy() {
                                 continue;
                             try {
                                 const parsed = JSON.parse(data);
+                                // message_start: { type: "message_start", message: { usage: { input_tokens, cache_* } } }
+                                const msgObj = parsed['message'];
+                                if (msgObj?.['usage']) {
+                                    Object.assign(usageData, msgObj['usage']);
+                                }
+                                // message_delta: { type: "message_delta", usage: { output_tokens } }
                                 if (parsed['usage']) {
-                                    usageData = parsed['usage'];
+                                    Object.assign(usageData, parsed['usage']);
                                 }
                             }
                             catch { /* malformed SSE line */ }
@@ -120,7 +126,8 @@ function startProxy() {
                         : parsedBody['system'] != null ? JSON.stringify(parsedBody['system']) : null;
                     const messages = Array.isArray(parsedBody['messages']) ? parsedBody['messages'] : [];
                     if (req.url?.includes('/messages') && req.method === 'POST') {
-                        logger.writeCall({ ts: startTs, model, system, messages, usage: usageData, duration_ms });
+                        const usage = Object.keys(usageData).length > 0 ? usageData : null;
+                        logger.writeCall({ ts: startTs, model, system, messages, usage, duration_ms });
                     }
                 });
             });

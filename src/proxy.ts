@@ -61,7 +61,7 @@ export function startProxy(): void {
         res.writeHead(upstreamRes.statusCode ?? 200, upstreamRes.headers);
 
         const isSSE = (upstreamRes.headers['content-type'] ?? '').includes('text/event-stream');
-        let usageData: UsageRecord | null = null;
+        let usageData: UsageRecord = {};
 
         upstreamRes.on('data', (chunk: Buffer) => {
           res.write(chunk);
@@ -75,8 +75,16 @@ export function startProxy(): void {
               if (data === '[DONE]') continue;
               try {
                 const parsed = JSON.parse(data) as Record<string, unknown>;
+
+                // message_start: { type: "message_start", message: { usage: { input_tokens, cache_* } } }
+                const msgObj = parsed['message'] as Record<string, unknown> | undefined;
+                if (msgObj?.['usage']) {
+                  Object.assign(usageData, msgObj['usage'] as UsageRecord);
+                }
+
+                // message_delta: { type: "message_delta", usage: { output_tokens } }
                 if (parsed['usage']) {
-                  usageData = parsed['usage'] as UsageRecord;
+                  Object.assign(usageData, parsed['usage'] as UsageRecord);
                 }
               } catch { /* malformed SSE line */ }
             }
@@ -94,7 +102,8 @@ export function startProxy(): void {
           const messages = Array.isArray(parsedBody['messages']) ? parsedBody['messages'] : [];
 
           if (req.url?.includes('/messages') && req.method === 'POST') {
-            logger.writeCall({ ts: startTs, model, system, messages, usage: usageData, duration_ms });
+            const usage = Object.keys(usageData).length > 0 ? usageData : null;
+            logger.writeCall({ ts: startTs, model, system, messages, usage, duration_ms });
           }
         });
       });
