@@ -38,9 +38,8 @@ const commander_1 = require("commander");
 const child_process = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
-const os = __importStar(require("os"));
-const TRACER_DIR = path.join(os.homedir(), '.claude-tracer');
-const PID_FILE = path.join(TRACER_DIR, 'daemon.pid');
+const shared_1 = require("./shared");
+const PID_FILE = path.join(shared_1.TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
 const SEP = '─'.repeat(49);
 function readState() {
@@ -62,60 +61,12 @@ function isRunning(pid) {
 }
 function countCalls(sessionId) {
     try {
-        return fs.readFileSync(path.join(TRACER_DIR, 'sessions', sessionId, 'calls.jsonl'), 'utf8')
+        return fs.readFileSync(path.join(shared_1.TRACER_DIR, 'sessions', sessionId, 'calls.jsonl'), 'utf8')
             .split('\n').filter(l => l.trim()).length;
     }
     catch {
         return 0;
     }
-}
-function readCalls(sessionId) {
-    try {
-        return fs.readFileSync(path.join(TRACER_DIR, 'sessions', sessionId, 'calls.jsonl'), 'utf8')
-            .split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
-    }
-    catch {
-        return [];
-    }
-}
-function listSessions() {
-    try {
-        const dir = path.join(TRACER_DIR, 'sessions');
-        return fs.readdirSync(dir)
-            .filter(n => { try {
-            return fs.statSync(path.join(dir, n)).isDirectory();
-        }
-        catch {
-            return false;
-        } })
-            .sort().reverse();
-    }
-    catch {
-        return [];
-    }
-}
-function fmt(n) { return n.toLocaleString('en-US'); }
-function fmtTime(ts) { try {
-    return new Date(ts).toTimeString().slice(0, 8);
-}
-catch {
-    return ts;
-} }
-function fmtDate(ts) { try {
-    return new Date(ts).toISOString().slice(0, 16).replace('T', ' ');
-}
-catch {
-    return ts;
-} }
-function diffLine(e) {
-    if (e.is_tool_use && e.tool_name) {
-        const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
-        return `  + ${e.role}: [tool_use: ${e.tool_name}${m ? ' → ' + m[1] : ''}]`;
-    }
-    if (e.content_summary.includes('"type":"tool_result"') || e.content_summary.includes('"type": "tool_result"')) {
-        return `  + ${e.role}: [tool_result]`;
-    }
-    return `  + ${e.role}: "${e.content_summary.replace(/\n/g, ' ').slice(0, 60)}"`;
 }
 const program = new commander_1.Command();
 program.name('claude-tracer').description('Transparent proxy for tracing Claude Code API calls').version('0.1.0');
@@ -189,20 +140,20 @@ program.command('status').description('Show proxy daemon status').action(() => {
 // show
 program.command('show [session_id]').description('List sessions or show call timeline').action((sessionId) => {
     if (!sessionId) {
-        const sessions = listSessions();
+        const sessions = (0, shared_1.listSessions)();
         if (!sessions.length) {
             console.log('No sessions found.');
             process.exit(0);
         }
         for (const sid of sessions) {
-            const calls = readCalls(sid);
+            const calls = (0, shared_1.readCalls)(sid);
             const last = calls[calls.length - 1];
             const total = last?.input_token_total ?? calls.reduce((s, c) => s + (c.usage?.input_tokens ?? 0), 0);
-            console.log(`${sid}  ${calls[0]?.ts ? fmtDate(calls[0].ts) : '(unknown)'}  ${calls.length} calls  ${fmt(total)} tokens`);
+            console.log(`${sid}  ${calls[0]?.ts ? (0, shared_1.fmtDate)(calls[0].ts) : '(unknown)'}  ${calls.length} calls  ${(0, shared_1.fmt)(total)} tokens`);
         }
         process.exit(0);
     }
-    const calls = readCalls(sessionId);
+    const calls = (0, shared_1.readCalls)(sessionId);
     if (!calls.length) {
         console.error(`No calls found for session: ${sessionId}`);
         process.exit(1);
@@ -214,12 +165,12 @@ program.command('show [session_id]').description('List sessions or show call tim
         const inp = c.usage?.input_tokens ?? 0;
         const out = c.usage?.output_tokens ?? 0;
         outTok += out;
-        const delta = c.call_index > 0 ? `  (+${fmt(inp)})` : '';
+        const delta = c.call_index > 0 ? `  (+${(0, shared_1.fmt)(inp)})` : '';
         const reset = c.context_reset ? '  [RESET]' : '';
-        console.log(`Call ${c.call_index}  ${fmtTime(c.ts)}  ${c.model}  ${fmt(c.input_token_total ?? inp)} tok  ${(c.duration_ms / 1000).toFixed(1)}s${delta}${reset}`);
+        console.log(`Call ${c.call_index}  ${(0, shared_1.fmtTime)(c.ts)}  ${c.model}  ${(0, shared_1.fmt)(c.input_token_total ?? inp)} tok  ${(c.duration_ms / 1000).toFixed(1)}s${delta}${reset}`);
         if (c.diff && c.diff.length > 0) {
             for (const e of c.diff)
-                console.log(diffLine(e));
+                console.log((0, shared_1.diffLine)(e));
         }
         else if (c.call_index === 0) {
             const fm = c.messages[0];
@@ -229,7 +180,7 @@ program.command('show [session_id]').description('List sessions or show call tim
     }
     const total = calls[calls.length - 1]?.input_token_total ?? 0;
     console.log(SEP);
-    console.log(`Total: ${calls.length} calls | ${fmt(total)} input tokens | ${fmt(outTok)} output tokens`);
+    console.log(`Total: ${calls.length} calls | ${(0, shared_1.fmt)(total)} input tokens | ${(0, shared_1.fmt)(outTok)} output tokens`);
     const resets = calls.filter(c => c.context_reset).length;
     if (resets > 0)
         console.log(`Context resets: ${resets}`);
@@ -242,7 +193,7 @@ program.command('diff <session_id> <call_index>').description('Show prompt diff 
         console.error(`Invalid call_index: ${idxStr}`);
         process.exit(1);
     }
-    const calls = readCalls(sessionId);
+    const calls = (0, shared_1.readCalls)(sessionId);
     if (!calls.length) {
         console.error(`No calls found for session: ${sessionId}`);
         process.exit(1);
