@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DaemonState } from './types';
 import { TRACER_DIR, readCalls, listSessions, fmt, fmtTime, fmtDate, diffLine } from './shared';
+import { startWatch } from './watch';
 
 const PID_FILE = path.join(TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
@@ -142,5 +143,13 @@ program.command('diff <session_id> <call_index>').description('Show prompt diff 
   console.log(`Full messages[]: ${total} total (${total - added} carried + ${added} new)`);
   process.exit(0);
 });
+
+// watch
+program
+  .command('watch [session_id]')
+  .description('Open live two-panel TUI (timeline + diff detail)')
+  .action((sessionId?: string) => {
+    startWatch(sessionId);
+  });
 
 program.parse(process.argv);
