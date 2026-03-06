@@ -2,9 +2,9 @@
 
 ## Current Position
 
-Phase: Phase 3 complete — TUI watch command fully implemented
-Status: Phase 3 complete — TUI watch command fully implemented
-Last activity: 2026-03-06 — Plan 03-03 complete
+Phase: v1.0 complete
+Status: All 3 phases verified and shipped
+Last activity: 2026-03-06 — Phase 3 verified (5/7, 2 gaps waived by owner)
 
 ## Progress
 
