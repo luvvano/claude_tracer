@@ -3,10 +3,9 @@ import { Command } from 'commander';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { DaemonState, CallRecord } from './types';
+import { DaemonState } from './types';
+import { TRACER_DIR, readCalls, listSessions, fmt, fmtTime, fmtDate, diffLine } from './shared';
 
-const TRACER_DIR = path.join(os.homedir(), '.claude-tracer');
 const PID_FILE = path.join(TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
 const SEP = '─'.repeat(49);
@@ -26,37 +25,6 @@ function countCalls(sessionId: string): number {
     return fs.readFileSync(path.join(TRACER_DIR, 'sessions', sessionId, 'calls.jsonl'), 'utf8')
       .split('\n').filter(l => l.trim()).length;
   } catch { return 0; }
-}
-
-function readCalls(sessionId: string): CallRecord[] {
-  try {
-    return fs.readFileSync(path.join(TRACER_DIR, 'sessions', sessionId, 'calls.jsonl'), 'utf8')
-      .split('\n').filter(l => l.trim()).map(l => JSON.parse(l) as CallRecord);
-  } catch { return []; }
-}
-
-function listSessions(): string[] {
-  try {
-    const dir = path.join(TRACER_DIR, 'sessions');
-    return fs.readdirSync(dir)
-      .filter(n => { try { return fs.statSync(path.join(dir, n)).isDirectory(); } catch { return false; } })
-      .sort().reverse();
-  } catch { return []; }
-}
-
-function fmt(n: number): string { return n.toLocaleString('en-US'); }
-function fmtTime(ts: string): string { try { return new Date(ts).toTimeString().slice(0, 8); } catch { return ts; } }
-function fmtDate(ts: string): string { try { return new Date(ts).toISOString().slice(0, 16).replace('T', ' '); } catch { return ts; } }
-
-function diffLine(e: { role: string; content_summary: string; is_tool_use: boolean; tool_name?: string }): string {
-  if (e.is_tool_use && e.tool_name) {
-    const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
-    return `  + ${e.role}: [tool_use: ${e.tool_name}${m ? ' → ' + m[1] : ''}]`;
-  }
-  if (e.content_summary.includes('"type":"tool_result"') || e.content_summary.includes('"type": "tool_result"')) {
-    return `  + ${e.role}: [tool_result]`;
-  }
-  return `  + ${e.role}: "${e.content_summary.replace(/\n/g, ' ').slice(0, 60)}"`;
 }
 
 const program = new Command();
