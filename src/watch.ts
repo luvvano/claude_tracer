@@ -1,147 +1,116 @@
 import * as blessed from 'blessed';
+import * as fs from 'fs';
 import * as path from 'path';
+import { TRACER_DIR, readCalls, listSessions, fmt, fmtTime, diffLine } from './shared';
 import { CallRecord } from './types';
-import { TRACER_DIR, readCalls, listSessions, fmt, fmtTime, fmtDate } from './shared';
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-function elapsedStr(calls: CallRecord[]): string {
-  if (!calls.length) return '00:00';
-  const start = new Date(calls[0].ts).getTime();
-  const end = new Date(calls[calls.length - 1].ts).getTime();
-  const s = Math.floor((end - start) / 1000);
-  const mm = String(Math.floor(s / 60)).padStart(2, '0');
-  const ss = String(s % 60).padStart(2, '0');
-  return `${mm}:${ss}`;
-}
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
 function timelineItem(c: CallRecord): string {
   const tok = fmt(c.input_token_total ?? c.usage?.input_tokens ?? 0);
+  const dur = (c.duration_ms / 1000).toFixed(1) + 's';
   const reset = c.context_reset ? ' [R]' : '';
-  return ` Call ${c.call_index}  ${fmtTime(c.ts)}  ${tok} tok${reset}`;
+  return ` ${String(c.call_index).padStart(3)}  ${fmtTime(c.ts)}  ${tok} tok  ${dur}${reset}`;
 }
 
-function renderDetailContent(call: CallRecord): string {
+function renderDetail(c: CallRecord | null): string {
+  if (!c) return '{bold}Select a call from the timeline.{/bold}';
+
   const lines: string[] = [];
-
-  if (call.context_reset) {
-    lines.push('{red-fg}{bold}⚠  CONTEXT RESET — all messages are new{/bold}{/red-fg}');
-    lines.push('');
-  }
-
-  const added = call.diff?.length ?? 0;
-  const total = (call.messages as unknown[]).length;
-  lines.push(`{bold}Call ${call.call_index}{/bold}  —  ${added} new message${added !== 1 ? 's' : ''} of ${total} total`);
-  lines.push('{bold}' + '─'.repeat(44) + '{/bold}');
+  lines.push(`{bold}Call ${c.call_index}{/bold}  ${fmtTime(c.ts)}  ${c.model}`);
+  lines.push(`Input: ${fmt(c.input_token_total ?? c.usage?.input_tokens ?? 0)} tok  Output: ${fmt(c.usage?.output_tokens ?? 0)} tok  Duration: ${(c.duration_ms / 1000).toFixed(2)}s`);
+  if (c.context_reset) lines.push('{yellow-fg}[CONTEXT RESET]{/yellow-fg}');
   lines.push('');
 
-  const diffEntries = call.diff ?? [];
-
-  if (diffEntries.length === 0) {
-    if (call.call_index === 0) {
-      const msgs = call.messages as Record<string, unknown>[];
-      if (msgs.length > 0) {
-        const fm = msgs[0];
-        lines.push(`{green-fg}[+] ${fm['role']}{/green-fg}`);
-        const content = String(fm['content'] ?? '').replace(/\n/g, ' ').slice(0, 300);
-        lines.push(`    ${content}${content.length >= 300 ? '…' : ''}`);
-        lines.push('');
+  const diff = c.diff ?? [];
+  if (diff.length === 0) {
+    if (c.call_index === 0) {
+      const fm = (c.messages as Record<string, unknown>[])[0];
+      if (fm) {
+        lines.push(`{green-fg}+ ${String(fm['role'])}: "${String(fm['content']).slice(0, 120)}"{/green-fg}`);
+      } else {
+        lines.push('(first call — no diff data)');
       }
     } else {
-      lines.push('  (no diff data available)');
+      lines.push('(no diff data)');
     }
   } else {
-    for (const e of diffEntries) {
-      if (e.is_tool_use && e.tool_name) {
-        const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
-        lines.push(`{green-fg}[+] ${e.role}{/green-fg}`);
-        lines.push(`    {cyan-fg}[tool_use: ${e.tool_name}${m ? ' → ' + m[1] : ''}]{/cyan-fg}`);
-      } else if (
-        e.content_summary.includes('"type":"tool_result"') ||
-        e.content_summary.includes('"type": "tool_result"')
-      ) {
-        const lenMatch = e.content_summary.match(/"content"\s*:\s*"([^"]*)"/);
-        const chars = lenMatch ? lenMatch[1].length : 0;
-        lines.push(`{green-fg}[+] ${e.role}{/green-fg}`);
-        lines.push(`    {cyan-fg}[tool_result${chars ? ': ' + chars + ' chars' : ''}]{/cyan-fg}`);
+    lines.push(`{bold}Diff (+${diff.length} messages):{/bold}`);
+    for (const e of diff) {
+      const raw = diffLine(e);
+      // colour the diff lines
+      if (raw.startsWith('+')) {
+        lines.push(`{green-fg}${raw}{/green-fg}`);
+      } else if (raw.startsWith('-')) {
+        lines.push(`{red-fg}${raw}{/red-fg}`);
       } else {
-        lines.push(`{green-fg}[+] ${e.role}{/green-fg}`);
-        const summary = e.content_summary.replace(/\n/g, ' ').slice(0, 300);
-        lines.push(`    ${summary}${summary.length >= 300 ? '…' : ''}`);
+        lines.push(raw);
       }
-      lines.push('');
     }
-  }
-
-  lines.push('');
-  lines.push(`{bold}Model:{/bold}    ${call.model}`);
-  lines.push(`{bold}Duration:{/bold} ${(call.duration_ms / 1000).toFixed(2)}s`);
-  if (call.usage) {
-    lines.push(`{bold}Tokens:{/bold}   in=${fmt(call.usage.input_tokens ?? 0)}  out=${fmt(call.usage.output_tokens ?? 0)}  cache_read=${fmt(call.usage.cache_read_input_tokens ?? 0)}`);
   }
 
   return lines.join('\n');
 }
 
-// ─── session picker ──────────────────────────────────────────────────────────
+// ─── session picker ────────────────────────────────────────────────────────────
 
-function runSessionPicker(
-  screen: blessed.Widgets.Screen,
-  sessions: string[],
-  onSelect: (sessionId: string) => void
-): void {
-  const items = sessions.map(sid => {
-    const calls = readCalls(sid);
-    const tokens = calls.length ? (calls[calls.length - 1].input_token_total ?? 0) : 0;
-    const date = calls.length ? fmtDate(calls[0].ts) : '(unknown)';
-    return ` ${sid}  ${date}  ${calls.length} calls  ${fmt(tokens)} tok`;
+function pickSession(screen: blessed.Widgets.Screen): Promise<string | null> {
+  return new Promise((resolve) => {
+    const sessions = listSessions();
+    if (!sessions.length) {
+      resolve(null);
+      return;
+    }
+
+    const picker = blessed.list({
+      top: 'center',
+      left: 'center',
+      width: '70%',
+      height: '60%',
+      keys: true,
+      vi: true,
+      border: 'line',
+      label: ' Pick a session (Enter to open, q to quit) ',
+      style: {
+        selected: { bg: 'blue', bold: true },
+        item: { fg: 'white' },
+      },
+      items: sessions.map(sid => {
+        const calls = readCalls(sid);
+        const tok = calls[calls.length - 1]?.input_token_total ?? 0;
+        return ` ${sid}  ${calls.length} calls  ${fmt(tok)} tok`;
+      }),
+    });
+
+    screen.append(picker);
+    picker.focus();
+    screen.render();
+
+    picker.on('select', (_item, index) => {
+      screen.remove(picker);
+      screen.render();
+      resolve(sessions[index]);
+    });
+
+    screen.key(['q', 'C-c'], () => {
+      screen.destroy();
+      process.exit(0);
+    });
   });
-
-  const boxH = Math.min(sessions.length + 4, 20);
-
-  const picker = blessed.list({
-    top: 'center',
-    left: 'center',
-    width: '80%',
-    height: boxH,
-    label: ' Select Session  (↑↓ / j k)  Enter=open  q=quit ',
-    items,
-    keys: true,
-    vi: true,
-    border: 'line',
-    style: {
-      selected: { bg: 'blue', bold: true },
-      item: { fg: 'white' },
-    },
-  });
-
-  picker.on('select', (_item: blessed.Widgets.BlessedElement, index: number) => {
-    screen.destroy();
-    setTimeout(() => onSelect(sessions[index]), 50);
-  });
-
-  screen.key(['q', 'C-c'], () => {
-    screen.destroy();
-    process.exit(0);
-  });
-
-  screen.append(picker);
-  picker.focus();
-  screen.render();
 }
 
-// ─── main watch view ─────────────────────────────────────────────────────────
+// ─── main TUI ──────────────────────────────────────────────────────────────────
 
-export function openWatch(sessionId: string): void {
-  let calls = readCalls(sessionId);
-
+export async function openWatch(sessionId: string): Promise<void> {
   const screen = blessed.screen({
     smartCSR: true,
-    title: `claude-tracer: ${sessionId}`,
+    title: 'claude-tracer watch',
     fullUnicode: true,
   });
 
-  // Left panel
+  let calls: CallRecord[] = readCalls(sessionId);
+
+  // Left panel — timeline
   const timeline = blessed.list({
     left: 0,
     top: 0,
@@ -151,6 +120,7 @@ export function openWatch(sessionId: string): void {
     vi: true,
     border: 'line',
     label: ' Timeline ',
+    tags: true,
     style: {
       selected: { bg: 'blue', bold: true },
       item: { fg: 'white' },
@@ -158,7 +128,7 @@ export function openWatch(sessionId: string): void {
     items: calls.length ? calls.map(timelineItem) : ['(no calls yet)'],
   });
 
-  // Right panel
+  // Right panel — detail
   const detail = blessed.box({
     right: 0,
     top: 0,
@@ -172,8 +142,8 @@ export function openWatch(sessionId: string): void {
     label: ' Detail ',
     tags: true,
     content: calls.length
-      ? renderDetailContent(calls[0])
-      : '{bold}No calls yet. Waiting…{/bold}',
+      ? renderDetail(calls[0])
+      : '{bold}Select a call from the timeline.{/bold}',
   });
 
   // Status bar
@@ -184,43 +154,23 @@ export function openWatch(sessionId: string): void {
     height: 3,
     border: 'line',
     tags: true,
+    content: '',
   });
 
   function updateStatus(): void {
-    const count = calls.length;
-    const tokens = count ? (calls[count - 1].input_token_total ?? 0) : 0;
-    const elapsed = elapsedStr(calls);
-    const sid = sessionId.length > 24 ? sessionId.slice(-24) : sessionId;
-    status.setContent(` {bold}${sid}{/bold} │ ${count} call${count !== 1 ? 's' : ''} │ ${fmt(tokens)} tok │ ${elapsed}`);
+    const total = calls[calls.length - 1]?.input_token_total ?? 0;
+    const out = calls.reduce((s, c) => s + (c.usage?.output_tokens ?? 0), 0);
+    status.setContent(
+      ` {bold}${sessionId}{/bold} | ${calls.length} calls | in: ${fmt(total)} | out: ${fmt(out)} tok | q: quit`
+    );
   }
 
   function selectCall(index: number): void {
-    if (!calls.length) return;
-    const idx = Math.max(0, Math.min(index, calls.length - 1));
-    detail.setContent(renderDetailContent(calls[idx]));
+    const c = calls[index] ?? null;
+    detail.setContent(renderDetail(c));
     detail.scrollTo(0);
     screen.render();
   }
-
-  timeline.on('select', (_item: blessed.Widgets.BlessedElement, index: number) => {
-    selectCall(index);
-  });
-
-  // Tab switches focus
-  screen.key('tab', () => {
-    if (screen.focused === (timeline as unknown as blessed.Widgets.BlessedElement)) {
-      detail.focus();
-    } else {
-      timeline.focus();
-    }
-    screen.render();
-  });
-
-  // Quit
-  screen.key(['q', 'C-c'], () => {
-    screen.destroy();
-    process.exit(0);
-  });
 
   screen.append(timeline);
   screen.append(detail);
@@ -228,48 +178,168 @@ export function openWatch(sessionId: string): void {
 
   updateStatus();
 
-  if (calls.length) {
-    timeline.select(0);
-    selectCall(0);
-  }
+  // Navigate timeline
+  timeline.on('select item', (_item, index) => {
+    selectCall(index);
+  });
+
+  // Tab to switch focus between panels
+  screen.key(['tab'], () => {
+    if (screen.focused === timeline) {
+      detail.focus();
+    } else {
+      timeline.focus();
+    }
+    screen.render();
+  });
+
+  // Initial quit handler (will be overridden below)
+  screen.key(['q', 'C-c'], () => {
+    screen.destroy();
+    process.exit(0);
+  });
 
   timeline.focus();
   screen.render();
+
+  // ─── live update via fs.watch ─────────────────────────────────────────────
+  const callsFile = path.join(TRACER_DIR, 'sessions', sessionId, 'calls.jsonl');
+  let pendingNew = 0;
+
+  function isAtBottom(): boolean {
+    const sel = (timeline as unknown as { selected: number }).selected ?? 0;
+    return sel >= calls.length - 1;
+  }
+
+  function setTimelineLabel(label: string): void {
+    (timeline as unknown as { setLabel: (s: string) => void }).setLabel(label);
+  }
+
+  function addTimelineItem(text: string): void {
+    (timeline as unknown as { addItem: (s: string) => void }).addItem(text);
+  }
+
+  function highlightRow(index: number): void {
+    const item = ` {cyan-fg}${timelineItem(calls[index]).trim()}{/cyan-fg}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (timeline as unknown as any).setItem(index, item);
+    screen.render();
+    setTimeout(() => {
+      if (index < calls.length) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (timeline as unknown as any).setItem(index, timelineItem(calls[index]));
+        screen.render();
+      }
+    }, 1000);
+  }
+
+  let fsWatcher: ReturnType<typeof fs.watch> | null = null;
+
+  function startWatcher(): void {
+    try {
+      fsWatcher = fs.watch(callsFile, { persistent: true }, () => {
+        const newCalls = readCalls(sessionId);
+        if (newCalls.length > calls.length) {
+          const wasAtBottom = isAtBottom();
+          const added = newCalls.slice(calls.length);
+          calls.push(...added);
+
+          for (const c of added) {
+            addTimelineItem(timelineItem(c));
+          }
+
+          updateStatus();
+
+          if (wasAtBottom) {
+            const newIdx = calls.length - 1;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (timeline as unknown as any).select(newIdx);
+            selectCall(newIdx);
+            pendingNew = 0;
+            setTimelineLabel(' Timeline ');
+          } else {
+            pendingNew += added.length;
+            setTimelineLabel(` Timeline  +${pendingNew} new `);
+          }
+
+          // Cyan highlight for new rows
+          for (let i = calls.length - added.length; i < calls.length; i++) {
+            highlightRow(i);
+          }
+
+          screen.render();
+        }
+      });
+    } catch {
+      // File may not exist yet if 0 calls; retry after 2s
+      setTimeout(startWatcher, 2000);
+    }
+  }
+
+  startWatcher();
+
+  // When user navigates, clear pending indicator
+  timeline.on('keypress', () => {
+    if (isAtBottom() && pendingNew > 0) {
+      pendingNew = 0;
+      setTimelineLabel(' Timeline ');
+      screen.render();
+    }
+  });
+
+  // Override quit to also close watcher
+  screen.unkey('q', () => {});
+  screen.unkey('C-c', () => {});
+  screen.key(['q', 'C-c'], () => {
+    if (fsWatcher) fsWatcher.close();
+    screen.destroy();
+    process.exit(0);
+  });
 }
 
-// ─── entry point ─────────────────────────────────────────────────────────────
+// ─── entry point ──────────────────────────────────────────────────────────────
 
 export function startWatch(sessionId?: string): void {
-  const sessions = listSessions();
-
-  if (sessions.length === 0) {
-    console.error('No sessions found. Run: claude-tracer start && ANTHROPIC_BASE_URL=http://localhost:7749 claude');
-    process.exit(1);
-  }
-
-  if (sessionId) {
-    if (!sessions.includes(sessionId)) {
-      console.error(`Session not found: ${sessionId}`);
-      console.error('Available:\n' + sessions.join('\n'));
-      process.exit(1);
-    }
-    openWatch(sessionId);
-    return;
-  }
-
-  if (sessions.length === 1) {
-    openWatch(sessions[0]);
-    return;
-  }
-
-  // Multiple sessions — interactive picker
   const screen = blessed.screen({
     smartCSR: true,
-    title: 'claude-tracer — select session',
+    title: 'claude-tracer',
     fullUnicode: true,
   });
 
-  runSessionPicker(screen, sessions, (selected) => {
-    openWatch(selected);
+  async function run(): Promise<void> {
+    let sid = sessionId;
+
+    if (!sid) {
+      const sessions = listSessions();
+      if (!sessions.length) {
+        screen.destroy();
+        console.error('No sessions found. Start the proxy and run some Claude Code commands first.');
+        process.exit(1);
+      }
+
+      if (sessions.length === 1) {
+        sid = sessions[0];
+        screen.destroy();
+      } else {
+        sid = (await pickSession(screen)) ?? undefined;
+        if (!sid) {
+          screen.destroy();
+          process.exit(0);
+        }
+        screen.destroy();
+      }
+    } else {
+      screen.destroy();
+    }
+
+    if (sid) {
+      await openWatch(sid);
+    }
+  }
+
+  run().catch(err => {
+    screen.destroy();
+    console.error(err);
+    process.exit(1);
   });
 }
