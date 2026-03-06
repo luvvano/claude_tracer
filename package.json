@@ -1,0 +1,21 @@
+{
+  "name": "claude-tracer",
+  "version": "0.1.0",
+  "description": "Transparent proxy that logs Claude Code API calls",
+  "main": "dist/proxy.js",
+  "bin": {
+    "claude-tracer": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "start": "node dist/proxy.js"
+  },
+  "dependencies": {
+    "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0"
+  }
+}
