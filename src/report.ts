@@ -1,110 +1,85 @@
-"use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.generateReport = generateReport;
-const fs = __importStar(require("fs"));
-const path = __importStar(require("path"));
-const shared_1 = require("./shared");
+import * as fs from 'fs';
+import * as path from 'path';
+import { ConversationGroup, CallRecord, DiffEntry } from './types';
+import { TRACER_DIR, fmt, fmtTime } from './shared';
+
 // ─── formatting helpers ───────────────────────────────────────────────────────
-function fmtDuration(ms) {
-    if (ms < 1000)
-        return `${ms}ms`;
-    if (ms < 60_000)
-        return `${(ms / 1000).toFixed(1)}s`;
-    const m = Math.floor(ms / 60_000);
-    const s = Math.floor((ms % 60_000) / 1000);
-    return `${m}m ${s}s`;
+
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
 }
-function escHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function escHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+
 // ─── call detail HTML ─────────────────────────────────────────────────────────
-function renderCallDetail(call) {
-    const lines = [];
-    if (call.context_reset) {
-        lines.push(`<div class="reset-banner">⚠ CONTEXT RESET — all messages are new</div>`);
+
+function renderCallDetail(call: CallRecord): string {
+  const lines: string[] = [];
+
+  if (call.context_reset) {
+    lines.push(`<div class="reset-banner">⚠ CONTEXT RESET — all messages are new</div>`);
+  }
+
+  const diffEntries = (call.diff ?? []) as DiffEntry[];
+
+  if (diffEntries.length === 0) {
+    lines.push(`<p class="muted">(no diff data — first call or baseline)</p>`);
+  } else {
+    for (const e of diffEntries) {
+      let content = '';
+      if (e.is_tool_use && e.tool_name) {
+        const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
+        content = `<span class="tool-badge">${escHtml(e.tool_name)}${m ? ' → ' + escHtml(m[1]) : ''}</span>`;
+      } else if (
+        e.content_summary.includes('"type":"tool_result"') ||
+        e.content_summary.includes('"type": "tool_result"')
+      ) {
+        const lenMatch = e.content_summary.match(/"content"\s*:\s*"([^"]*)"/);
+        const chars = lenMatch ? lenMatch[1].length : 0;
+        content = `<span class="tool-result-badge">tool_result${chars ? ': ' + chars + ' chars' : ''}</span>`;
+      } else {
+        const summary = escHtml(e.content_summary.replace(/\n/g, ' ').slice(0, 500));
+        content = `<span class="msg-content">${summary}${e.content_summary.length > 500 ? '…' : ''}</span>`;
+      }
+      lines.push(`<div class="diff-entry role-${e.role}"><span class="role-tag">${escHtml(e.role)}</span>${content}</div>`);
     }
-    const diffEntries = (call.diff ?? []);
-    if (diffEntries.length === 0) {
-        lines.push(`<p class="muted">(no diff data — first call or baseline)</p>`);
+  }
+
+  lines.push(`<div class="call-meta">`);
+  lines.push(`<span>Model: ${escHtml(call.model)}</span>`);
+  lines.push(`<span>Duration: ${fmtDuration(call.duration_ms)}</span>`);
+  if (call.usage) {
+    lines.push(`<span>In: ${fmt(call.usage.input_tokens ?? 0)} tok</span>`);
+    lines.push(`<span>Out: ${fmt(call.usage.output_tokens ?? 0)} tok</span>`);
+    if ((call.usage.cache_read_input_tokens ?? 0) > 0) {
+      lines.push(`<span>Cache: ${fmt(call.usage.cache_read_input_tokens!)} tok</span>`);
     }
-    else {
-        for (const e of diffEntries) {
-            let content = '';
-            if (e.is_tool_use && e.tool_name) {
-                const m = e.content_summary.match(/"(?:path|file_path|command)"\s*:\s*"([^"]+)"/);
-                content = `<span class="tool-badge">${escHtml(e.tool_name)}${m ? ' → ' + escHtml(m[1]) : ''}</span>`;
-            }
-            else if (e.content_summary.includes('"type":"tool_result"') ||
-                e.content_summary.includes('"type": "tool_result"')) {
-                const lenMatch = e.content_summary.match(/"content"\s*:\s*"([^"]*)"/);
-                const chars = lenMatch ? lenMatch[1].length : 0;
-                content = `<span class="tool-result-badge">tool_result${chars ? ': ' + chars + ' chars' : ''}</span>`;
-            }
-            else {
-                const summary = escHtml(e.content_summary.replace(/\n/g, ' ').slice(0, 500));
-                content = `<span class="msg-content">${summary}${e.content_summary.length > 500 ? '…' : ''}</span>`;
-            }
-            lines.push(`<div class="diff-entry role-${e.role}"><span class="role-tag">${escHtml(e.role)}</span>${content}</div>`);
-        }
-    }
-    lines.push(`<div class="call-meta">`);
-    lines.push(`<span>Model: ${escHtml(call.model)}</span>`);
-    lines.push(`<span>Duration: ${fmtDuration(call.duration_ms)}</span>`);
-    if (call.usage) {
-        lines.push(`<span>In: ${(0, shared_1.fmt)(call.usage.input_tokens ?? 0)} tok</span>`);
-        lines.push(`<span>Out: ${(0, shared_1.fmt)(call.usage.output_tokens ?? 0)} tok</span>`);
-        if ((call.usage.cache_read_input_tokens ?? 0) > 0) {
-            lines.push(`<span>Cache: ${(0, shared_1.fmt)(call.usage.cache_read_input_tokens)} tok</span>`);
-        }
-    }
-    lines.push(`</div>`);
-    return lines.join('\n');
+  }
+  lines.push(`</div>`);
+
+  return lines.join('\n');
 }
+
 // ─── call row HTML ────────────────────────────────────────────────────────────
-function renderCallRow(call, groupIndex, callIndex) {
-    const msgCount = call.messages.length;
-    const inputTok = call.usage?.input_tokens ?? 0;
-    const resetFlag = call.context_reset ? '<span class="reset-flag" title="Context reset">[R]</span>' : '';
-    const detailId = `detail-${groupIndex}-${callIndex}`;
-    return `
+
+function renderCallRow(call: CallRecord, groupIndex: number, callIndex: number): string {
+  const msgCount = (call.messages as unknown[]).length;
+  const inputTok = call.usage?.input_tokens ?? 0;
+  const resetFlag = call.context_reset ? '<span class="reset-flag" title="Context reset">[R]</span>' : '';
+  const detailId = `detail-${groupIndex}-${callIndex}`;
+
+  return `
 <div class="call-row" onclick="toggleDetail('${detailId}')">
   <span class="call-index">#${call.call_index}</span>
-  <span class="call-time">${(0, shared_1.fmtTime)(call.ts)}</span>
+  <span class="call-time">${fmtTime(call.ts)}</span>
   <span class="call-msgs">${msgCount} msgs</span>
-  <span class="call-tokens">${(0, shared_1.fmt)(inputTok)} in</span>
+  <span class="call-tokens">${fmt(inputTok)} in</span>
   <span class="call-dur">${fmtDuration(call.duration_ms)}</span>
   ${resetFlag}
   <span class="expand-arrow">▸</span>
@@ -113,25 +88,30 @@ function renderCallRow(call, groupIndex, callIndex) {
   ${renderCallDetail(call)}
 </div>`;
 }
+
 // ─── group node HTML (recursive) ─────────────────────────────────────────────
-function renderGroup(group, depth, groupIndex) {
-    const myIndex = groupIndex.value++;
-    const nodeId = `group-${myIndex}`;
-    const depthClass = `depth-${Math.min(depth, 5)}`;
-    const callsHtml = group.calls
-        .map((c, i) => renderCallRow(c, myIndex, i))
-        .join('\n');
-    const childrenHtml = group.children
-        .map(child => renderGroup(child, depth + 1, groupIndex))
-        .join('\n');
-    return `
+
+function renderGroup(group: ConversationGroup, depth: number, groupIndex: { value: number }): string {
+  const myIndex = groupIndex.value++;
+  const nodeId = `group-${myIndex}`;
+  const depthClass = `depth-${Math.min(depth, 5)}`;
+
+  const callsHtml = group.calls
+    .map((c, i) => renderCallRow(c, myIndex, i))
+    .join('\n');
+
+  const childrenHtml = group.children
+    .map(child => renderGroup(child, depth + 1, groupIndex))
+    .join('\n');
+
+  return `
 <div class="group-node ${depthClass}" id="${nodeId}">
   <div class="group-header" onclick="toggleGroup('${nodeId}')">
     <span class="group-toggle">▶</span>
     <span class="group-label">${escHtml(group.label)}</span>
     <span class="group-stats">
       ${group.stats.callCount} call${group.stats.callCount !== 1 ? 's' : ''} ·
-      ${(0, shared_1.fmt)(group.stats.totalInputTokens)} in tok ·
+      ${fmt(group.stats.totalInputTokens)} in tok ·
       ${fmtDuration(group.stats.durationMs)}
     </span>
   </div>
@@ -143,21 +123,27 @@ function renderGroup(group, depth, groupIndex) {
   </div>
 </div>`;
 }
+
 // ─── sum tokens recursively ───────────────────────────────────────────────────
-function sumTokens(g) {
-    return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTokens(c), 0);
+
+function sumTokens(g: ConversationGroup): number {
+  return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTokens(c), 0);
 }
-function countGroups(g) {
-    return 1 + g.children.reduce((s, c) => s + countGroups(c), 0);
+
+function countGroups(g: ConversationGroup): number {
+  return 1 + g.children.reduce((s, c) => s + countGroups(c), 0);
 }
+
 // ─── full HTML document ───────────────────────────────────────────────────────
-function buildHtml(root, sessionId) {
-    const groupIndex = { value: 0 };
-    const treeHtml = renderGroup(root, 0, groupIndex);
-    const generatedAt = new Date().toISOString();
-    const totalTok = sumTokens(root);
-    const totalGroups = countGroups(root);
-    return `<!DOCTYPE html>
+
+function buildHtml(root: ConversationGroup, sessionId: string): string {
+  const groupIndex = { value: 0 };
+  const treeHtml = renderGroup(root, 0, groupIndex);
+  const generatedAt = new Date().toISOString();
+  const totalTok = sumTokens(root);
+  const totalGroups = countGroups(root);
+
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -442,7 +428,7 @@ code {
   <h1>⚡ claude-tracer: ${escHtml(sessionId)}</h1>
   <div class="meta">
     <span>Generated: ${generatedAt}</span>
-    <span>Total input tokens (all groups): ${(0, shared_1.fmt)(totalTok)}</span>
+    <span>Total input tokens (all groups): ${fmt(totalTok)}</span>
     <span>Conversation groups: ${totalGroups}</span>
   </div>
 </div>
@@ -478,13 +464,14 @@ document.addEventListener('DOMContentLoaded', function() {
 </body>
 </html>`;
 }
+
 // ─── public API ───────────────────────────────────────────────────────────────
-function generateReport(root, sessionId) {
-    const html = buildHtml(root, sessionId);
-    const outDir = path.join(shared_1.TRACER_DIR, 'sessions', sessionId);
-    fs.mkdirSync(outDir, { recursive: true });
-    const outPath = path.join(outDir, 'report.html');
-    fs.writeFileSync(outPath, html, 'utf8');
-    return outPath;
+
+export function generateReport(root: ConversationGroup, sessionId: string): string {
+  const html = buildHtml(root, sessionId);
+  const outDir = path.join(TRACER_DIR, 'sessions', sessionId);
+  fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(outDir, 'report.html');
+  fs.writeFileSync(outPath, html, 'utf8');
+  return outPath;
 }
-//# sourceMappingURL=report.js.map
