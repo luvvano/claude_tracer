@@ -14,20 +14,19 @@ Last activity: 2026-03-06 — GSD project created
 
 ## Key Decisions
 
-- Daemon: Node.js, port 7749, handles both event collection and API proxy in one process
-- Hook scripts: Python (matches Claude Code plugin pattern, fast startup, no deps)
-- Storage: JSONL per session (no DB, grep-friendly, tail-able for TUI)
-- Proxy: `ANTHROPIC_BASE_URL=http://localhost:7749` — transparent pass-through + capture
+- **No hooks** — proxy-only architecture; proxy captures everything from API traffic
+- Proxy: `ANTHROPIC_BASE_URL=http://localhost:7749` — transparent SSE passthrough + capture
+- Session = one daemon run; ID = `session_YYYYMMDD_HHMMSS`
+- Storage: `~/.claude-tracer/sessions/{session_id}/calls.jsonl` — one line per LLM call
+- System prompt stored in full every call (simple for v1)
 - Sensitive masking: keys matching `token|key|password|secret|auth|credential` → `"***"`
-- Plugin install: copy to `~/.claude/plugins/cache/local/claude-tracer/`
+- Manual start: `claude-tracer start` + `ANTHROPIC_BASE_URL=... claude` (two steps)
 
 ## Tech Stack
 
-- Hook scripts: Python 3 (stdlib only — json, sys, urllib.request)
-- Daemon: Node.js / TypeScript (http, fs, stream)
-- CLI: Node.js with commander
+- Proxy + CLI: Node.js / TypeScript
 - TUI: blessed or ink (decision deferred to Phase 3 planning)
-- Storage: `~/.claude-tracer/sessions/{session_id}/events.jsonl` + `prompts.jsonl`
+- Storage: JSONL (no DB, grep-friendly, tail-able)
 
 ## Blockers
 

@@ -11,83 +11,73 @@ When you're debugging why Claude Code made a decision, called the wrong tool, or
 ## Architecture
 
 ```
-Claude Code session
-  ├── Hooks (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)
-  │     └── POST http://localhost:7749/event  →  Event daemon writes to events.jsonl
-  └── ANTHROPIC_BASE_URL=http://localhost:7749
-        └── Proxy intercepts API calls → logs messages[], diffs, tokens
-              └── Forwards to real Anthropic API
+Claude Code → ANTHROPIC_BASE_URL=http://localhost:7749 → claude-tracer proxy → api.anthropic.com
+                                                              │
+                                                    logs full request + response
+                                                              │
+                                               ~/.claude-tracer/sessions/{id}/calls.jsonl
 
-claude-tracer watch  ←  tails events.jsonl + prompts.jsonl  →  live TUI
+claude-tracer watch  ←  tails calls.jsonl  →  live TUI (second pane)
 ```
+
+**No hooks. No Claude Code plugin.** Pure proxy — intercepts all API traffic, captures everything:
+- Full `messages[]` array (includes tool_use and tool_result blocks — all tool calls visible)
+- `system` field — complete system prompt as Claude Code assembled it (CLAUDE.md + skills + plugin instructions)
+- `usage` — input/output/cache tokens from final SSE chunk
+- `duration_ms` — wall time per LLM call
 
 ## Requirements v1.0
 
-- [ ] Claude Code plugin (`~/.claude/plugins/`) with hook scripts (Python, stdin/stdout JSON)
-- [ ] Hooks: SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, Stop
-- [ ] Local HTTP server (Node.js) on port 7749:
-  - Event endpoint `/event` — receives hook payloads, writes to JSONL
-  - Proxy endpoint `/v1/*` — forwards to Anthropic API, intercepts messages[] + usage
-- [ ] JSONL storage at `~/.claude-tracer/` — events.jsonl + prompts.jsonl
-- [ ] CLI: `claude-tracer` with subcommands: `start` (daemon), `watch` (TUI), `show` (recent sessions)
-- [ ] TUI: live two-panel layout — timeline (left) + detail/diff (right)
-- [ ] Prompt diff: show what changed in messages[] between each LLM call
-- [ ] Tool call display: name, input params (sensitive masked), duration, status
-- [ ] Token display: input/output/cache tokens per LLM call, running total
-- [ ] CLAUDE.md scanner: at SessionStart, list which CLAUDE.md files are loaded from project tree
+- [ ] Node.js proxy server on port 7749 — transparent passthrough to `api.anthropic.com`
+- [ ] Handles SSE streaming (Claude Code uses `stream: true`) — passes chunks through unchanged, captures final usage chunk
+- [ ] JSONL storage: `~/.claude-tracer/sessions/{session_id}/calls.jsonl` — one line per LLM call
+- [ ] Each call logged: `{ts, call_index, model, system, messages[], usage, duration_ms}`
+- [ ] Sensitive value masking: keys matching `token|key|password|secret|auth|credential` → `"***"`
+- [ ] CLI: `claude-tracer start` / `stop` / `status`
+- [ ] TUI: `claude-tracer watch` — live two-panel layout — timeline (left) + detail/diff (right)
+- [ ] Prompt diff: what changed in `messages[]` between consecutive LLM calls in a session
+- [ ] Token display: input/output/cache tokens per call, running total
 
 ## Context
 
-### Hook payload format (Claude Code)
+### API request format (what proxy receives from Claude Code)
 ```json
-// PreToolUse stdin
-{ "session_id": "...", "tool_name": "Bash", "tool_input": { "command": "ls" } }
-
-// PostToolUse stdin  
-{ "session_id": "...", "tool_name": "Bash", "tool_input": {...}, "tool_response": "..." }
-
-// UserPromptSubmit stdin
-{ "session_id": "...", "prompt": "..." }
+POST /v1/messages
+{
+  "model": "claude-opus-4-5",
+  "stream": true,
+  "system": "...full assembled system prompt (CLAUDE.md + skills + plugin instructions)...",
+  "messages": [
+    {"role": "user", "content": "write me a function"},
+    {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "content": "file1.ts\nfile2.ts"}]},
+    ...
+  ],
+  "max_tokens": 8192
+}
 ```
-
-### Plugin structure (matches Claude Code marketplace pattern)
-```
-.claude-plugin/plugin.json   — plugin manifest with hook definitions
-hooks/
-  pretooluse.py
-  posttooluse.py
-  sessionstart.py
-  userpromptsubmit.py
-  stop.py
-```
-
-### API proxy approach
-- `ANTHROPIC_BASE_URL` set via plugin's SessionStart hook (writes to session env)
-- Proxy at `localhost:7749/v1/messages` receives full request body (messages[], model, system)
-- Computes diff vs previous call in same session
-- Forwards to `api.anthropic.com`, streams response, captures usage from final chunk
 
 ### Storage layout
 ```
 ~/.claude-tracer/
-  daemon.pid        — proxy/event server PID
+  daemon.pid        — proxy server PID
   sessions/
-    {session_id}/
-      events.jsonl  — hook events (tools, user prompts, session lifecycle)
-      prompts.jsonl — LLM calls (messages[], diffs, tokens)
+    session_20260306_143000/
+      calls.jsonl   — one line per LLM call: {ts, call_index, model, system, messages, usage, duration_ms}
 ```
 
 ## Key Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Node.js daemon for proxy + event server | Single process handles both; streams API responses efficiently |
-| Python for hook scripts | Matches Claude Code plugin ecosystem (hookify pattern); no deps, fast startup |
-| Hook scripts POST to local daemon | Hooks are per-event; daemon holds session state for diffing |
+| Proxy-only, no hooks | Proxy gives everything (messages[], system, usage, tool calls) — hooks add complexity for zero gain |
+| Node.js for proxy | Fast streams, native SSE handling, single process |
 | JSONL storage (no DB) | Simple, tail-able, zero setup, grep-friendly |
+| Full system prompt stored every call | Simple for v1; dedup via hash deferred to v2 |
 | Port 7749 | Unlikely collision; fixed for simplicity |
-| `claude-tracer watch` separate process | Non-intrusive — Claude Code runs normally, watcher reads logs |
-| Mask sensitive params | Keys/tokens in tool params masked before logging |
+| Manual start (two steps) | Explicit — user controls when tracing is active |
+| `claude-tracer watch` separate pane | Non-intrusive — Claude Code runs normally, watcher reads logs |
+| Session = one daemon run | Simple session boundary; one `claude-tracer start` = one session |
 
 ## Constraints
 

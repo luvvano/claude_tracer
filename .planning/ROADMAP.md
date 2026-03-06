@@ -15,16 +15,17 @@
 ## Phase Details
 
 ### Phase 1: Foundation
-**Goal**: Plugin installs, hooks fire on tool calls, events written to disk
-**Requirements**: PLG-01..07, STR-01..04, CLI-01..02, CLI-04..05, CLD-01..03, DMN-01..02
+**Goal**: Proxy daemon running — intercepts Claude Code API calls, logs full messages[] + usage to JSONL
+**Requirements**: DMN-01..08, STR-01..04, CLI-01..02
 
 **Success Criteria**:
-1. Plugin installed and enabled in Claude Code — hooks appear in `~/.claude/settings.json`
-2. `claude-tracer start` launches daemon on port 7749
-3. Running `claude` → making a tool call → `cat ~/.claude-tracer/sessions/*/events.jsonl` shows the event
-4. UserPromptSubmit, SessionStart, Stop events all appear in JSONL
-5. CLAUDE.md files from project tree listed as first event in session
-6. Hook scripts exit gracefully with no output if daemon is down
+1. `claude-tracer start` launches proxy on port 7749, prints session ID
+2. `ANTHROPIC_BASE_URL=http://localhost:7749 claude` works — Claude Code behaves identically (proxy is transparent)
+3. Making a tool call in Claude Code → `cat ~/.claude-tracer/sessions/*/calls.jsonl` shows the full LLM call with messages[] including the tool_use + tool_result blocks
+4. SSE streaming works — no timeout, no corruption, responses arrive at normal speed
+5. `usage` field populated (input/output/cache tokens) from final SSE chunk
+6. `claude-tracer stop` stops daemon cleanly
+7. `claude-tracer status` shows running state + session ID + call count
 
 ### Phase 2: Proxy & Prompt Capture
 **Goal**: Every LLM call logged with full messages[], diff vs prior call, token counts
