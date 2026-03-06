@@ -2,14 +2,14 @@
 
 ## Current Position
 
-Phase: Phase 2 in progress — 02-01 complete, starting 02-02
-Status: diff engine live, context-reset guard + input_token_total tracking in logger
-Last activity: 2026-03-06 — Plan 02-01 complete
+Phase: Phase 2 complete — diff engine + show/diff CLI working
+Status: Phase 2 complete — all commands operational
+Last activity: 2026-03-06 — Plan 02-02 complete
 
 ## Progress
 
 - [x] Phase 1: Foundation
-- [ ] Phase 2: Proxy & Prompt Capture
+- [x] Phase 2: Proxy & Prompt Capture
 - [ ] Phase 3: Terminal UI
 
 ## Key Decisions
