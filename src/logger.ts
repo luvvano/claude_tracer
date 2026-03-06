@@ -109,7 +109,14 @@ export class SessionLogger {
     const currentMessages = record.messages as unknown[];
     const maskedMessages = maskSensitive(currentMessages) as unknown[];
 
-    const { diff, contextReset } = computeDiff(this.previousMessages, currentMessages);
+    // First call always has empty diff (no previous baseline to compare against).
+    let diff: DiffEntry[] = [];
+    let contextReset = false;
+    if (this.callIndex > 0) {
+      const result = computeDiff(this.previousMessages, currentMessages);
+      diff = result.diff;
+      contextReset = result.contextReset;
+    }
 
     const inputTokens = record.usage?.input_tokens ?? 0;
     this.inputTokenTotal += inputTokens;
