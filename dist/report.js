@@ -48,19 +48,113 @@ function fmtDur(ms) {
 function escHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function serializeCall(c) {
-    const inTok = c.usage?.input_tokens ?? 0;
-    const outTok = c.usage?.output_tokens ?? 0;
+function classifyTool(toolName) {
+    const n = toolName.toLowerCase();
+    if (/bash|shell|run|exec|terminal|command/.test(n))
+        return 'shell';
+    if (/read|write|edit|multi.?edit|create|delete|file|glob|grep/.test(n))
+        return 'file';
+    if (/web|search|fetch|browse|brave|url|http/.test(n))
+        return 'web';
+    if (/task|agent|spawn|subagent/.test(n))
+        return 'agent';
+    if (/skill/.test(n))
+        return 'skill';
+    return 'other';
+}
+const KIND_STYLE = {
+    shell: { bg: '#0e2e12', border: '#238636', label: '#3fb950', dot: '#3fb950' },
+    file: { bg: '#0d2045', border: '#1f6feb', label: '#79c0ff', dot: '#58a6ff' },
+    web: { bg: '#1e0a38', border: '#6e40c9', label: '#bc8cff', dot: '#bc8cff' },
+    agent: { bg: '#2a1800', border: '#9e5000', label: '#f0883e', dot: '#f0883e' },
+    skill: { bg: '#2a0020', border: '#ad2d78', label: '#ff7eb6', dot: '#ff7eb6' },
+    user: { bg: '#161b22', border: '#30363d', label: '#8b949e', dot: '#8b949e' },
+    other: { bg: '#161b22', border: '#388bfd', label: '#79c0ff', dot: '#79c0ff' },
+};
+function flattenCalls(root) {
+    // Collect all calls from all groups
+    const all = [];
+    function walk(g) {
+        for (const c of g.calls) {
+            all.push({ call: c, groupLabel: g.label, groupId: g.id });
+        }
+        g.children.forEach(walk);
+    }
+    walk(root);
+    // Sort by timestamp
+    all.sort((a, b) => new Date(a.call.ts).getTime() - new Date(b.call.ts).getTime());
+    // Build flat list
+    const result = [];
+    let prevGroupId = '';
+    let prevTokTotal = 0;
+    for (const { call, groupLabel, groupId } of all) {
+        const diff = (call.diff ?? []);
+        // Primary tool: last tool_use in diff (what the assistant DID in this call)
+        const toolEntries = diff.filter(e => e.is_tool_use && e.tool_name);
+        const primaryTool = toolEntries.length ? toolEntries[toolEntries.length - 1].tool_name : null;
+        // Tool kind
+        const toolKind = primaryTool ? classifyTool(primaryTool) : 'user';
+        // Action label
+        let actionLabel;
+        if (primaryTool) {
+            // Try to extract target path/command from content_summary
+            const last = toolEntries[toolEntries.length - 1];
+            const pathMatch = last.content_summary.match(/"(?:path|file_path)"\s*:\s*"([^"]+)"/);
+            const cmdMatch = last.content_summary.match(/"command"\s*:\s*"([^"]{1,40})"/);
+            const target = pathMatch ? pathMatch[1].split('/').pop() : cmdMatch ? cmdMatch[1].slice(0, 30) : null;
+            actionLabel = target ? `${primaryTool}: ${target}` : primaryTool;
+        }
+        else {
+            // Use first user message in diff
+            const userEntry = diff.find(e => e.role === 'user' && !e.is_tool_use);
+            if (userEntry) {
+                actionLabel = userEntry.content_summary.replace(/\n/g, ' ').slice(0, 40);
+                if (userEntry.content_summary.length > 40)
+                    actionLabel += '…';
+            }
+            else {
+                actionLabel = '(continuation)';
+            }
+        }
+        // Per-call input tokens: use usage.input_tokens; if 0, use delta of input_token_total
+        let inTok = call.usage?.input_tokens ?? 0;
+        if (inTok === 0 && call.input_token_total) {
+            inTok = call.input_token_total - prevTokTotal;
+            if (inTok < 0)
+                inTok = call.input_token_total;
+        }
+        prevTokTotal = call.input_token_total ?? prevTokTotal;
+        result.push({
+            call,
+            groupLabel,
+            groupId,
+            groupChanged: groupId !== prevGroupId,
+            primaryTool,
+            toolKind,
+            actionLabel,
+            inTok,
+            outTok: call.usage?.output_tokens ?? 0,
+        });
+        prevGroupId = groupId;
+    }
+    return result;
+}
+function serFlat(f) {
+    const c = f.call;
     return {
         idx: c.call_index,
         ts: c.ts,
         msgCount: c.messages.length,
-        inTok,
-        outTok,
+        inTok: f.inTok,
+        outTok: f.outTok,
         cacheTok: c.usage?.cache_read_input_tokens ?? 0,
         durMs: c.duration_ms,
         model: c.model,
         reset: c.context_reset ?? false,
+        toolKind: f.toolKind,
+        actionLabel: f.actionLabel,
+        groupLabel: f.groupLabel,
+        groupChanged: f.groupChanged,
         diff: (c.diff ?? []).map(e => ({
             role: e.role,
             isToolUse: e.is_tool_use,
@@ -69,25 +163,14 @@ function serializeCall(c) {
         })),
     };
 }
-function serializeGroup(g) {
-    return {
-        id: g.id,
-        label: g.label,
-        callCount: g.stats.callCount,
-        inputTok: g.stats.totalInputTokens,
-        outputTok: g.stats.totalOutputTokens,
-        durationMs: g.stats.durationMs,
-        children: g.children.map(serializeGroup),
-        calls: g.calls.map(serializeCall),
-    };
-}
 function sumTok(g) {
     return g.stats.totalInputTokens + g.children.reduce((s, c) => s + sumTok(c), 0);
 }
 // ─── HTML ─────────────────────────────────────────────────────────────────────
-function buildHtml(root, sessionId) {
-    const data = JSON.stringify(serializeGroup(root));
+function buildHtml(root, sessionId, flatCalls) {
+    const data = JSON.stringify(flatCalls.map(serFlat));
     const totalTok = sumTok(root);
+    const kindStyleJson = JSON.stringify(KIND_STYLE);
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -95,121 +178,124 @@ function buildHtml(root, sessionId) {
 <title>claude-tracer: ${escHtml(sessionId)}</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'SF Mono','Fira Code','Consolas',monospace; font-size: 13px; background:#0d1117; color:#c9d1d9; }
-#hdr { background:#161b22; border-bottom:1px solid #30363d; padding:10px 16px; display:flex; gap:20px; align-items:center; position:sticky; top:0; z-index:10; }
-#hdr h1 { font-size:14px; color:#58a6ff; font-weight:700; }
-.meta { font-size:11px; color:#8b949e; }
-#zoom { font-size:11px; color:#8b949e; margin-left:auto; }
-#viewport { width:100%; height:calc(100vh - 41px); overflow:hidden; position:relative; cursor:grab; background:#0d1117; }
-#viewport:active { cursor:grabbing; }
+body { font-family:'SF Mono','Fira Code','Consolas',monospace; font-size:13px; background:#0d1117; color:#c9d1d9; display:flex; flex-direction:column; height:100vh; }
+
+#hdr { background:#161b22; border-bottom:1px solid #30363d; padding:9px 16px; display:flex; gap:18px; align-items:center; flex-shrink:0; }
+#hdr h1 { font-size:14px; color:#58a6ff; font-weight:700; white-space:nowrap; }
+.meta { font-size:11px; color:#8b949e; white-space:nowrap; }
+#zlbl { margin-left:auto; font-size:11px; color:#484f58; white-space:nowrap; }
+
+#legend { display:flex; gap:12px; align-items:center; padding:6px 16px; background:#0d1117; border-bottom:1px solid #21262d; flex-shrink:0; flex-wrap:wrap; }
+.leg { display:flex; align-items:center; gap:5px; font-size:10px; color:#8b949e; }
+.ldot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+
+#main { display:flex; flex:1; overflow:hidden; }
+#vp { flex:1; overflow:hidden; position:relative; cursor:grab; background:#0d1117; }
+#vp:active { cursor:grabbing; }
 #canvas { position:absolute; transform-origin:0 0; }
-/* SVG */
 svg { overflow:visible; }
-.edge { fill:none; stroke:#484f58; stroke-width:1.5; }
-.edge-spawn { fill:none; stroke:#388bfd; stroke-width:1.5; stroke-dasharray:4 3; }
-/* Nodes */
-.gnode { cursor:pointer; }
-.gnode rect { rx:6; stroke-width:1.5; transition:filter .15s; }
-.gnode:hover rect { filter:brightness(1.25); }
-.gnode.active rect { stroke-width:2.5 !important; }
-.gnode text { font-family:'SF Mono','Fira Code','Consolas',monospace; }
-/* Detail panel */
-#detail { position:fixed; bottom:0; left:0; right:0; max-height:45vh; background:#161b22; border-top:2px solid #30363d; z-index:20; display:none; overflow:hidden; flex-direction:column; }
-#detail.open { display:flex; }
-#dh { padding:8px 16px; border-bottom:1px solid #30363d; display:flex; align-items:center; gap:10px; flex-shrink:0; }
-#dh strong { color:#e6edf3; font-size:13px; }
-#dh .ds { color:#8b949e; font-size:11px; }
-#dclose { margin-left:auto; cursor:pointer; color:#8b949e; font-size:18px; line-height:1; }
-#dclose:hover { color:#e6edf3; }
-#dcalls { overflow-y:auto; flex:1; }
-.ci { border-bottom:1px solid #21262d; }
-.ch { display:flex; gap:10px; align-items:center; padding:6px 16px; cursor:pointer; font-size:12px; }
-.ch:hover { background:#21262d; }
-.ci.open .ch { background:#1c2333; }
-.cn { color:#8b949e; min-width:30px; }
-.ct { color:#3fb950; min-width:62px; }
-.cm { color:#79c0ff; min-width:48px; }
-.ck { color:#e3b341; min-width:80px; }
-.cd { color:#8b949e; }
-.cr { color:#f85149; font-weight:700; margin-left:4px; }
-.ca { display:none; padding:6px 16px 10px 44px; }
-.ci.open .ca { display:block; }
-.de { display:flex; gap:8px; align-items:flex-start; padding:3px 0; border-bottom:1px solid #21262d; font-size:11px; }
+
+/* detail panel */
+#dp { width:380px; border-left:1px solid #30363d; background:#0d1117; display:none; flex-direction:column; overflow:hidden; }
+#dp.open { display:flex; }
+#dph { padding:8px 14px; border-bottom:1px solid #30363d; display:flex; align-items:center; gap:8px; flex-shrink:0; }
+#dph .dptitle { font-weight:700; color:#e6edf3; flex:1; font-size:12px; }
+#dph .dpclose { cursor:pointer; color:#8b949e; font-size:16px; }
+#dph .dpclose:hover { color:#e6edf3; }
+#dpb { overflow-y:auto; flex:1; padding:10px 14px; }
+
+.de { display:flex; gap:6px; align-items:flex-start; padding:3px 0; border-bottom:1px solid #21262d; font-size:11px; }
 .de:last-child { border-bottom:none; }
-.dr { min-width:66px; font-weight:600; font-size:10px; padding:2px 5px; border-radius:2px; }
+.dr { min-width:64px; font-weight:600; font-size:10px; padding:2px 4px; border-radius:2px; flex-shrink:0; }
 .du .dr { background:#0e4429; color:#3fb950; }
 .da .dr { background:#0d419d; color:#79c0ff; }
 .dc { color:#c9d1d9; word-break:break-word; }
 .tb { background:#21262d; border:1px solid #30363d; padding:1px 5px; border-radius:3px; color:#79c0ff; font-size:10px; }
 .trb { background:#21262d; border:1px solid #30363d; padding:1px 5px; border-radius:3px; color:#8b949e; font-size:10px; }
-.dm { font-size:10px; color:#8b949e; padding-top:4px; display:flex; gap:10px; flex-wrap:wrap; border-top:1px solid #21262d; margin-top:4px; }
-.rb { background:#3d1210; color:#f85149; font-weight:600; padding:3px 8px; border-radius:3px; font-size:11px; margin-bottom:4px; }
+.dm { font-size:10px; color:#8b949e; margin-top:8px; display:flex; gap:10px; flex-wrap:wrap; border-top:1px solid #21262d; padding-top:6px; }
+.rb { background:#3d1210; color:#f85149; font-size:11px; padding:3px 7px; border-radius:3px; margin-bottom:6px; font-weight:600; }
+
+#dpb h3 { font-size:11px; color:#8b949e; margin-bottom:8px; padding-bottom:4px; border-bottom:1px solid #21262d; }
 </style>
 </head>
 <body>
 <div id="hdr">
   <h1>⚡ claude-tracer: ${escHtml(sessionId)}</h1>
-  <span class="meta">Total input tokens: ${(0, shared_1.fmt)(totalTok)}</span>
-  <span class="meta">${new Date().toISOString()}</span>
-  <span id="zoom">zoom: 100% · scroll=zoom · drag=pan</span>
+  <span class="meta">${flatCalls.length} calls</span>
+  <span class="meta">Session tokens: ${(0, shared_1.fmt)(totalTok)}</span>
+  <span class="meta">${new Date().toISOString().slice(0, 19).replace('T', ' ')}</span>
+  <span id="zlbl">scroll=zoom · drag=pan · click=detail</span>
 </div>
-<div id="viewport">
-  <div id="canvas">
-    <svg id="svg"></svg>
-  </div>
+<div id="legend">
+  <span class="leg"><span class="ldot" style="background:#3fb950"></span>shell/exec</span>
+  <span class="leg"><span class="ldot" style="background:#58a6ff"></span>file I/O</span>
+  <span class="leg"><span class="ldot" style="background:#bc8cff"></span>web/search</span>
+  <span class="leg"><span class="ldot" style="background:#f0883e"></span>agent/task</span>
+  <span class="leg"><span class="ldot" style="background:#ff7eb6"></span>skill</span>
+  <span class="leg"><span class="ldot" style="background:#8b949e"></span>user/other</span>
 </div>
-<div id="detail">
-  <div id="dh">
-    <strong id="dtitle"></strong>
-    <span class="ds" id="dstats"></span>
-    <span id="dclose">✕</span>
+<div id="main">
+  <div id="vp">
+    <div id="canvas"><svg id="svg"></svg></div>
   </div>
-  <div id="dcalls"></div>
+  <div id="dp">
+    <div id="dph">
+      <span class="dptitle" id="dptitle">Call detail</span>
+      <span class="dpclose" id="dpclose">✕</span>
+    </div>
+    <div id="dpb" id="dpbody"></div>
+  </div>
 </div>
 <script>
-const ROOT = ${data};
+const CALLS = ${data};
+const STYLES = ${kindStyleJson};
 
-// ─── layout constants ─────────────────────────────────────────────────────────
-const NW = 190, NH = 76, HGAP = 48, VGAP = 80;
+const NW = 260, NH = 58, VGAP = 28, PAD = 40;
+const COL_W = NW + 80;   // column width inc gap (for multi-column future use)
 
-// ─── recursive subtree width ──────────────────────────────────────────────────
-function treeW(n) {
-  if (!n.children.length) return NW;
-  const cw = n.children.reduce((s,c) => s + treeW(c), 0) + HGAP * (n.children.length - 1);
-  return Math.max(NW, cw);
+// ─── compute per-call cumulative token totals for sparkline ───────────────────
+let runTotal = 0;
+const tokByIdx = CALLS.map(c => { runTotal += c.inTok; return runTotal; });
+
+// ─── layout: single vertical column ──────────────────────────────────────────
+// Each call is placed at (PADX, PAD + i*(NH+VGAP))
+const PADX = PAD;
+const totalH = PAD + CALLS.length * (NH + VGAP) + PAD;
+const totalW = PADX + NW + PAD + 200; // extra right space for labels
+
+const svg = document.getElementById('svg');
+svg.setAttribute('width', totalW);
+svg.setAttribute('height', totalH);
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function mk(tag, attrs={}) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,String(v));
+  return el;
 }
 
-// ─── layout: assign _x, _y ───────────────────────────────────────────────────
-function layout(n, x, y) {
-  n._y = y;
-  if (!n.children.length) { n._x = x; return; }
-  const tw = n.children.reduce((s,c) => s + treeW(c), 0) + HGAP*(n.children.length-1);
-  let cx = x - tw/2 + treeW(n.children[0])/2;
-  n.children.forEach(c => {
-    layout(c, cx, y + NH + VGAP);
-    cx += treeW(c) + HGAP;
-  });
-  const f = n.children[0], l = n.children[n.children.length-1];
-  n._x = (f._x + l._x) / 2;
+// defs: arrow markers per kind
+const defs = mk('defs');
+const kinds = [...new Set(CALLS.map(c=>c.toolKind))];
+for (const kind of kinds) {
+  const col = STYLES[kind]?.border ?? '#484f58';
+  const m = mk('marker', {id:'arr_'+kind, markerWidth:'7',markerHeight:'6',refX:'6',refY:'3',orient:'auto'});
+  const p = mk('polygon', {points:'0,0 7,3 0,6', fill:col});
+  m.appendChild(p); defs.appendChild(m);
 }
+// group-change arrow (dashed)
+const gm = mk('marker', {id:'arr_group',markerWidth:'7',markerHeight:'6',refX:'6',refY:'3',orient:'auto'});
+const gp = mk('polygon', {points:'0,0 7,3 0,6',fill:'#484f58'});
+gm.appendChild(gp); defs.appendChild(gm);
+svg.appendChild(defs);
 
-function allNodes(n, out=[]) { out.push(n); n.children.forEach(c=>allNodes(c,out)); return out; }
+const eG = mk('g'); svg.appendChild(eG);
+const nG = mk('g'); svg.appendChild(nG);
 
-layout(ROOT, 0, 0);
-const nodes = allNodes(ROOT);
-
-// bounding box
-const PAD = 60;
-const xs = nodes.map(n=>n._x), ys = nodes.map(n=>n._y);
-const ox = Math.min(...xs) - PAD, oy = Math.min(...ys) - PAD;
-const sw = Math.max(...xs) - Math.min(...xs) + NW + PAD*2;
-const sh = Math.max(...ys) - Math.min(...ys) + NH + PAD*2;
-
-// total tokens (for %)
-function sumTok(n) { return n.inputTok + n.children.reduce((s,c)=>s+sumTok(c),0); }
-const TOTAL = sumTok(ROOT) || 1;
-
-function fmtTok(n) { return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n); }
+function fmtTok(n) {
+  if(!n) return '—';
+  return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n);
+}
 function fmtDur(ms) {
   if(ms<1000) return ms+'ms';
   if(ms<60000) return (ms/1000).toFixed(1)+'s';
@@ -218,212 +304,172 @@ function fmtDur(ms) {
 function fmtTime(ts){ try{return new Date(ts).toTimeString().slice(0,8);}catch{return ts;} }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-// Colors per depth (pprof-inspired)
-const COLORS = [
-  {fill:'#0d2045', stroke:'#1f6feb', text:'#79c0ff'},  // depth 0 - blue
-  {fill:'#12260e', stroke:'#238636', text:'#3fb950'},   // depth 1 - green
-  {fill:'#1e0a2e', stroke:'#6e40c9', text:'#bc8cff'},   // depth 2 - purple
-  {fill:'#2a150a', stroke:'#9e4e00', text:'#f0883e'},   // depth 3 - orange
-  {fill:'#0a1f2a', stroke:'#1158a7', text:'#58a6ff'},   // depth 4 - cyan
-];
-function clr(depth) { return COLORS[Math.min(depth, COLORS.length-1)]; }
+// ─── draw edges first ─────────────────────────────────────────────────────────
+for (let i = 0; i < CALLS.length - 1; i++) {
+  const c = CALLS[i], nextC = CALLS[i+1];
+  const x1 = PADX + NW/2;
+  const y1 = PAD + i*(NH+VGAP) + NH;
+  const y2 = PAD + (i+1)*(NH+VGAP);
+  const x2 = x1;
+  const col = STYLES[c.toolKind]?.border ?? '#484f58';
 
-const SVG_NS = 'http://www.w3.org/2000/svg';
-function mk(tag, attrs={}) {
-  const el = document.createElementNS(SVG_NS, tag);
-  for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,v);
-  return el;
+  if (nextC.groupChanged) {
+    // dashed line for group transition
+    const line = mk('line', {x1,y1,x2,y2,stroke:'#484f58','stroke-width':'1.5','stroke-dasharray':'4 3'});
+    line.setAttribute('marker-end','url(#arr_group)');
+    eG.appendChild(line);
+  } else {
+    const line = mk('line', {x1,y1,x2,y2,stroke:col,'stroke-width':'1.5'});
+    line.setAttribute('marker-end','url(#arr_'+c.toolKind+')');
+    eG.appendChild(line);
+  }
 }
 
-const svg = document.getElementById('svg');
-svg.setAttribute('width', sw);
-svg.setAttribute('height', sh);
+// ─── draw nodes ───────────────────────────────────────────────────────────────
+let activeNode = null;
 
-// arrow marker
-const defs = mk('defs');
-const marker = mk('marker', {id:'arr',markerWidth:'8',markerHeight:'6',refX:'7',refY:'3',orient:'auto'});
-const poly = mk('polygon', {points:'0,0 8,3 0,6',fill:'#484f58'});
-marker.appendChild(poly);
-defs.appendChild(marker);
-svg.appendChild(defs);
+CALLS.forEach((c, i) => {
+  const st = STYLES[c.toolKind] ?? STYLES.other;
+  const nx = PADX, ny = PAD + i*(NH+VGAP);
 
-const markerSpawn = mk('marker', {id:'arr2',markerWidth:'8',markerHeight:'6',refX:'7',refY:'3',orient:'auto'});
-const poly2 = mk('polygon', {points:'0,0 8,3 0,6',fill:'#388bfd'});
-markerSpawn.appendChild(poly2);
-defs.appendChild(markerSpawn);
+  // group separator label
+  if (c.groupChanged && i > 0) {
+    const sep = mk('text', {x: nx, y: ny - 12, 'text-anchor':'start',
+      style:'font-size:9px;fill:#484f58;font-family:monospace'});
+    sep.textContent = '↳ ' + (c.groupLabel.length>40?c.groupLabel.slice(0,40)+'…':c.groupLabel);
+    nG.appendChild(sep);
+  }
 
-const eG = mk('g'); svg.appendChild(eG);
-const nG = mk('g'); svg.appendChild(nG);
+  const g = mk('g', {'data-idx':i});
+  g.style.cursor = 'pointer';
 
-// draw edges
-function drawEdge(parent, child, depth) {
-  const x1 = parent._x - ox + NW/2;
-  const y1 = parent._y - oy + NH;
-  const x2 = child._x - ox + NW/2;
-  const y2 = child._y - oy;
-  const my = (y1 + y2) / 2;
-  const isChild = depth > 0;
-  const p = mk('path', {
-    class: isChild ? 'edge-spawn' : 'edge',
-    d: \`M\${x1},\${y1} C\${x1},\${my} \${x2},\${my} \${x2},\${y2}\`,
-  });
-  p.setAttribute('marker-end', isChild ? 'url(#arr2)' : 'url(#arr)');
-  eG.appendChild(p);
-
-  // edge label
-  const t = mk('text', {'text-anchor':'middle', x:(x1+x2)/2, y:(y1+y2)/2-4,
-    style:'font-size:10px;fill:#484f58;font-family:monospace'});
-  t.textContent = child.callCount + ' call' + (child.callCount!==1?'s':'');
-  eG.appendChild(t);
-}
-
-function drawEdges(n, depth=0) {
-  n.children.forEach(c => { drawEdge(n, c, depth); drawEdges(c, depth+1); });
-}
-drawEdges(ROOT);
-
-// draw nodes
-let activeEl = null;
-
-function drawNode(n, depth) {
-  const nx = n._x - ox, ny = n._y - oy;
-  const c = clr(depth);
-  const pct = TOTAL>0?(n.inputTok/TOTAL*100).toFixed(1):'0.0';
-
-  const g = mk('g', {class:'gnode'});
-
-  const rect = mk('rect', {
-    x:nx, y:ny, width:NW, height:NH,
-    fill:c.fill, stroke:c.stroke, rx:5,
-  });
+  // background rect
+  const rect = mk('rect', {x:nx,y:ny,width:NW,height:NH,fill:st.bg,stroke:st.border,rx:5,'stroke-width':'1.5'});
   g.appendChild(rect);
 
-  // label
-  const maxL = 24;
-  const label = n.label.length>maxL ? n.label.slice(0,maxL)+'…' : n.label;
-  const t1 = mk('text', {x:nx+NW/2, y:ny+17, 'text-anchor':'middle',
-    style:\`font-size:12px;font-weight:700;fill:\${c.text}\`});
-  t1.textContent = label;
+  // left accent bar
+  const bar = mk('rect', {x:nx,y:ny,width:4,height:NH,fill:st.border,rx:2});
+  g.appendChild(bar);
+
+  // call index + time (top-left)
+  const t1 = mk('text', {x:nx+12,y:ny+14,style:'font-size:10px;fill:#8b949e;font-family:monospace'});
+  t1.textContent = '#'+c.idx+'  '+fmtTime(c.ts);
   g.appendChild(t1);
 
-  const tok = fmtTok(n.inputTok);
-  const t2 = mk('text', {x:nx+NW/2, y:ny+33, 'text-anchor':'middle',
-    style:'font-size:11px;fill:#e3b341'});
-  t2.textContent = tok + ' in tok';
+  // action label (main, center-ish)
+  const maxA = 28;
+  const aLabel = c.actionLabel.length>maxA ? c.actionLabel.slice(0,maxA)+'…' : c.actionLabel;
+  const t2 = mk('text', {x:nx+12,y:ny+32,style:\`font-size:13px;font-weight:700;fill:\${st.label};font-family:monospace\`});
+  t2.textContent = aLabel;
   g.appendChild(t2);
 
-  const t3 = mk('text', {x:nx+NW/2, y:ny+48, 'text-anchor':'middle',
-    style:'font-size:10px;fill:#8b949e'});
-  t3.textContent = pct + '% of total · ' + fmtDur(n.durationMs);
+  // tokens + duration (bottom)
+  const tokStr = c.inTok ? fmtTok(c.inTok)+' in' : '— tok';
+  const t3 = mk('text', {x:nx+12,y:ny+48,style:'font-size:10px;fill:#8b949e;font-family:monospace'});
+  t3.textContent = tokStr + '  ·  ' + fmtDur(c.durMs) + '  ·  ' + c.msgCount+' msgs';
   g.appendChild(t3);
 
-  const t4 = mk('text', {x:nx+NW/2, y:ny+63, 'text-anchor':'middle',
-    style:'font-size:10px;fill:#8b949e'});
-  t4.textContent = n.callCount + ' call' + (n.callCount!==1?'s':'');
-  g.appendChild(t4);
+  // reset indicator
+  if (c.reset) {
+    const rb = mk('text', {x:nx+NW-8,y:ny+14,'text-anchor':'end',style:'font-size:10px;fill:#f85149;font-weight:700'});
+    rb.textContent = '[R]';
+    g.appendChild(rb);
+  }
 
   g.addEventListener('click', e => {
     e.stopPropagation();
-    if(activeEl) activeEl.classList.remove('active');
-    g.classList.add('active');
-    activeEl = g;
-    openDetail(n);
+    if(activeNode) activeNode.querySelector('rect').setAttribute('stroke-width','1.5');
+    rect.setAttribute('stroke-width','2.5');
+    activeNode = g;
+    openDetail(c, i);
   });
 
   nG.appendChild(g);
-  n.children.forEach(c2 => drawNode(c2, depth+1));
-}
-drawNode(ROOT, 0);
-
-// auto-open root
-openDetail(ROOT);
-nG.firstChild?.classList.add('active');
-activeEl = nG.firstChild;
-
-// ─── detail panel ─────────────────────────────────────────────────────────────
-
-function openDetail(n) {
-  const panel = document.getElementById('detail');
-  panel.classList.add('open');
-  document.getElementById('dtitle').textContent = n.label;
-  document.getElementById('dstats').textContent =
-    n.callCount + ' calls · ' + fmtTok(n.inputTok) + ' in tok · ' + fmtDur(n.durationMs);
-
-  const body = document.getElementById('dcalls');
-  body.innerHTML = n.calls.map((call,i) => {
-    const diffHtml = call.diff.map(e => {
-      let content = '';
-      if (e.isToolUse && e.toolName) {
-        const m = e.summary.match(/"(?:path|file_path|command)"\\s*:\\s*"([^"]+)"/);
-        content = \`<span class="tb">\${esc(e.toolName)}\${m?' → '+esc(m[1]):''}</span>\`;
-      } else if (e.summary.includes('"type":"tool_result"')||e.summary.includes('"type": "tool_result"')) {
-        content = '<span class="trb">tool_result</span>';
-      } else {
-        const s = e.summary.replace(/\\n/g,' ').slice(0,300);
-        content = \`<span class="dc">\${esc(s)}\${e.summary.length>300?'…':''}</span>\`;
-      }
-      return \`<div class="de d\${esc(e.role[0])}"><span class="dr">\${esc(e.role)}</span>\${content}</div>\`;
-    }).join('');
-
-    return \`<div class="ci">
-  <div class="ch" onclick="toggleCall(this.parentElement)">
-    <span class="cn">#\${call.idx}</span>
-    <span class="ct">\${fmtTime(call.ts)}</span>
-    <span class="cm">\${call.msgCount} msgs</span>
-    <span class="ck">\${fmtTok(call.inTok)} in</span>
-    <span class="cd">\${fmtDur(call.durMs)}</span>
-    \${call.reset?'<span class="cr">[R]</span>':''}
-  </div>
-  <div class="ca">
-    \${call.reset?'<div class="rb">⚠ Context reset</div>':''}
-    \${diffHtml||'<span style="color:#484f58;font-size:11px">(no diff)</span>'}
-    <div class="dm">
-      <span>out: \${fmtTok(call.outTok)}</span>
-      <span>cache: \${fmtTok(call.cacheTok)}</span>
-      <span>\${esc(call.model)}</span>
-    </div>
-  </div>
-</div>\`;
-  }).join('');
-}
-
-function toggleCall(el) { el.classList.toggle('open'); }
-
-document.getElementById('dclose').addEventListener('click', () => {
-  document.getElementById('detail').classList.remove('open');
-  if(activeEl){ activeEl.classList.remove('active'); activeEl=null; }
 });
 
+// ─── detail panel ─────────────────────────────────────────────────────────────
+function openDetail(c, i) {
+  const panel = document.getElementById('dp');
+  panel.classList.add('open');
+
+  const title = document.getElementById('dptitle');
+  title.textContent = '#'+c.idx+' '+c.actionLabel;
+
+  const body = document.getElementById('dpb');
+  const st = STYLES[c.toolKind] ?? STYLES.other;
+
+  const diffHtml = c.diff.map(e => {
+    let content = '';
+    if (e.isToolUse && e.toolName) {
+      const m = e.summary.match(/"(?:path|file_path|command)"\\s*:\\s*"([^"]+)"/);
+      content = \`<span class="tb">\${esc(e.toolName)}\${m?' → '+esc(m[1]):''}</span>\`;
+    } else if (e.summary.includes('"type":"tool_result"')||e.summary.includes('"type": "tool_result"')) {
+      const lm = e.summary.match(/"content"\\s*:\\s*"([^"]*)"/);
+      const chars = lm ? lm[1].length : 0;
+      content = \`<span class="trb">tool_result\${chars?': '+chars+' chars':''}</span>\`;
+    } else {
+      const s = e.summary.replace(/\\n/g,' ').slice(0,350);
+      content = \`<span class="dc">\${esc(s)}\${e.summary.length>350?'…':''}</span>\`;
+    }
+    return \`<div class="de d\${esc(e.role[0])}"><span class="dr">\${esc(e.role)}</span>\${content}</div>\`;
+  }).join('');
+
+  body.innerHTML = \`
+<h3 style="color:\${esc(st.label)}">\${esc(c.actionLabel)}</h3>
+\${c.reset ? '<div class="rb">⚠ Context reset — all messages new</div>' : ''}
+\${diffHtml || '<span style="color:#484f58;font-size:11px">(no diff data)</span>'}
+<div class="dm">
+  <span>in: \${fmtTok(c.inTok)}</span>
+  <span>out: \${fmtTok(c.outTok)}</span>
+  <span>cache: \${fmtTok(c.cacheTok)}</span>
+  <span>\${esc(c.model)}</span>
+  <span>\${fmtDur(c.durMs)}</span>
+</div>\`;
+}
+
+document.getElementById('dpclose').addEventListener('click', () => {
+  document.getElementById('dp').classList.remove('open');
+  if(activeNode){ activeNode.querySelector('rect').setAttribute('stroke-width','1.5'); activeNode=null; }
+});
+
+// auto-open first call
+if(CALLS.length) {
+  openDetail(CALLS[0], 0);
+  nG.firstChild?.querySelector('rect')?.setAttribute('stroke-width','2.5');
+  activeNode = nG.firstChild;
+}
+
 // ─── pan + zoom ───────────────────────────────────────────────────────────────
-const vp = document.getElementById('viewport');
+const vp = document.getElementById('vp');
 const canvas = document.getElementById('canvas');
-let scale=1, tx=80, ty=40;
+let scale=1, tx=40, ty=20;
 
 function applyT() {
   canvas.style.transform=\`translate(\${tx}px,\${ty}px) scale(\${scale})\`;
-  document.getElementById('zoom').textContent='zoom: '+Math.round(scale*100)+'% · scroll=zoom · drag=pan';
+  document.getElementById('zlbl').textContent='zoom: '+Math.round(scale*100)+'% · scroll=zoom · drag=pan · click=detail';
 }
 applyT();
 
-vp.addEventListener('wheel', e => {
+vp.addEventListener('wheel', e=>{
   e.preventDefault();
-  const f = e.deltaY<0?1.1:0.9;
-  const r = vp.getBoundingClientRect();
-  const mx=e.clientX-r.left, my=e.clientY-r.top;
-  tx = mx-(mx-tx)*f; ty = my-(my-ty)*f; scale*=f;
-  applyT();
-}, {passive:false});
+  const f=e.deltaY<0?1.12:0.9;
+  const r=vp.getBoundingClientRect();
+  tx=(e.clientX-r.left)-(e.clientX-r.left-tx)*f;
+  ty=(e.clientY-r.top)-(e.clientY-r.top-ty)*f;
+  scale*=f; applyT();
+},{passive:false});
 
 let drag=false,dsx,dsy,dtx,dty;
-vp.addEventListener('mousedown', e=>{drag=true;dsx=e.clientX;dsy=e.clientY;dtx=tx;dty=ty;});
-window.addEventListener('mousemove', e=>{if(!drag)return;tx=dtx+(e.clientX-dsx);ty=dty+(e.clientY-dsy);applyT();});
-window.addEventListener('mouseup', ()=>{drag=false;});
+vp.addEventListener('mousedown',e=>{drag=true;dsx=e.clientX;dsy=e.clientY;dtx=tx;dty=ty;});
+window.addEventListener('mousemove',e=>{if(!drag)return;tx=dtx+(e.clientX-dsx);ty=dty+(e.clientY-dsy);applyT();});
+window.addEventListener('mouseup',()=>{drag=false;});
 </script>
 </body>
 </html>`;
 }
 function generateReport(root, sessionId) {
-    const html = buildHtml(root, sessionId);
+    const flatCalls = flattenCalls(root);
+    const html = buildHtml(root, sessionId, flatCalls);
     const outDir = path.join(shared_1.TRACER_DIR, 'sessions', sessionId);
     fs.mkdirSync(outDir, { recursive: true });
     const outPath = path.join(outDir, 'report.html');
