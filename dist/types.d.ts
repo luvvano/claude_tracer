@@ -30,4 +30,23 @@ export interface DaemonState {
     port: number;
     startedAt: string;
 }
+export interface ConversationGroup {
+    id: string;
+    systemSnippet: string;
+    label: string;
+    calls: CallRecord[];
+    parentCallIndex?: number;
+    parentGroupId?: string;
+    children: ConversationGroup[];
+    stats: ConversationGroupStats;
+}
+export interface ConversationGroupStats {
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCacheReadTokens: number;
+    callCount: number;
+    firstTs: string;
+    lastTs: string;
+    durationMs: number;
+}
 //# sourceMappingURL=types.d.ts.map

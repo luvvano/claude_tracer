@@ -33,3 +33,24 @@ export interface DaemonState {
   port: number;
   startedAt: string;
 }
+
+export interface ConversationGroup {
+  id: string;                     // fingerprint of system prompt (first 200 chars)
+  systemSnippet: string;          // first 80 chars for display
+  label: string;                  // "main session" for root, or task description snippet
+  calls: CallRecord[];            // all calls in this group, in order
+  parentCallIndex?: number;       // call_index of parent's tool_use that spawned this
+  parentGroupId?: string;         // fingerprint of spawning group
+  children: ConversationGroup[];  // subagents spawned from this group
+  stats: ConversationGroupStats;
+}
+
+export interface ConversationGroupStats {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  callCount: number;
+  firstTs: string;
+  lastTs: string;
+  durationMs: number;
+}

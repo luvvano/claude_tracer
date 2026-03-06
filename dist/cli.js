@@ -39,6 +39,7 @@ const child_process = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const shared_1 = require("./shared");
+const watch_1 = require("./watch");
 const PID_FILE = path.join(shared_1.TRACER_DIR, 'daemon.pid');
 const PROXY_SCRIPT = path.join(__dirname, 'proxy.js');
 const SEP = '─'.repeat(49);
@@ -227,6 +228,13 @@ program.command('diff <session_id> <call_index>').description('Show prompt diff 
     console.log(SEP);
     console.log(`Full messages[]: ${total} total (${total - added} carried + ${added} new)`);
     process.exit(0);
+});
+// watch
+program
+    .command('watch [session_id]')
+    .description('Open live two-panel TUI (timeline + diff detail)')
+    .action((sessionId) => {
+    (0, watch_1.startWatch)(sessionId);
 });
 program.parse(process.argv);
 //# sourceMappingURL=cli.js.map
