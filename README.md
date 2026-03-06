@@ -162,6 +162,31 @@ Call 3: 12 messages, 5 tool calls, 12400 input tokens, 2984ms
       calls.jsonl                     — one line per LLM call
 ```
 
+## Updating
+
+Pull latest changes and rebuild:
+
+```bash
+cd claude_tracer
+git pull origin master
+npm install        # only needed if dependencies changed
+npm run build
+npm link           # re-link the global binary
+```
+
+Verify the update:
+
+```bash
+claude-tracer --version
+```
+
+If the daemon is running, restart it after updating:
+
+```bash
+claude-tracer stop
+claude-tracer start
+```
+
 ## Roadmap
 
 - **Phase 2** (next): `claude-tracer diff` — show what changed between consecutive LLM calls
