@@ -2,13 +2,13 @@
 
 ## Current Position
 
-Phase: Phase 1 in progress — 01-01 complete, starting 01-02
-Status: Proxy core implemented, build passing, proxy starts on port 7749
-Last activity: 2026-03-06 — Plan 01-01 complete
+Phase: Phase 1 complete — proxy daemon + CLI working
+Status: proxy daemon running, CLI start/stop/status verified, npm link global install done
+Last activity: 2026-03-06 — Plan 01-02 complete
 
 ## Progress
 
-- [ ] Phase 1: Foundation
+- [x] Phase 1: Foundation
 - [ ] Phase 2: Proxy & Prompt Capture
 - [ ] Phase 3: Terminal UI
 
